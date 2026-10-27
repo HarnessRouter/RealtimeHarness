@@ -11,7 +11,7 @@ the framework we build on. Its live measurements are marked **to measure**, and 
 documentation's word before the first release. Section 2 derives the harness from section 1.
 Sections 3 to 11 cover leverage, the architecture, tool calls, the UHP extension, credentials,
 metering, operations, providers and conformance. Section 12 is the first release, and section 13
-lists the decisions still open.
+records the decisions made in review, and the one still open.
 
 ## 1. What a realtime model is
 
@@ -150,7 +150,7 @@ latency and remove nothing. So the harness owns what the model cannot own:
 6. **The provider, as a setting.** A product moves from one provider to another by changing the
    harness's model, not its client.
 
-What it is not: a speech-to-text, text model, text-to-speech cascade (§13, decision 5); a telephony
+What it is not: a speech-to-text, text model, text-to-speech cascade (§13, decision 4); a telephony
 carrier; or a media server.
 
 **Latency is the product.** A person notices a pause of 800 ms. Every hop, every tool call and every
@@ -429,6 +429,13 @@ realtime checks are added beside it (§11).
 The upstream validates every target against the server's configured provider list. A caller never
 names an upstream URL (Security §1.1).
 
+**The upstream is its own deployment.** A server's request-serving replicas roll often, and a roll
+waits only for the few turns in flight. Calls held open on those replicas would either block every
+roll for up to an hour, or be cut by it. So the upstream is a small service of its own, built from
+the server's code so it shares the server's credential broker, provider list and meter, and it stays
+inside the server's trust boundary so the meter remains authoritative. It has its own release cycle
+and its own drain (§9).
+
 ## 8. Metering and billing
 
 - **Who pays:** the organization of the principal that created the session, exactly as for a task.
@@ -450,9 +457,12 @@ names an upstream URL (Security §1.1).
 A realtime call is a socket held for minutes. A server that runs tasks of seconds needs four things
 it did not:
 
-1. **Drain, don't drop.** A replica being replaced stops taking new sessions and keeps its live ones
-   until they end or reach their maximum duration. A deployment counts a live call as a live turn,
-   and waits for it.
+1. **Drain, don't drop.** A replica of the harness or the upstream (§7) that is being replaced stops
+   taking new sessions, and keeps its live ones until they end or reach their maximum duration. A
+   deployment counts a live call as a live turn, and waits for it. The platform's termination grace
+   period caps how long a drain can hold a call. So the harness's `maxCallDuration` is set below that
+   grace period, or, where a call must outlast it, the harness records a planned resume seam at the
+   cap (item 2) rather than an unplanned cut.
 2. **Resume.** When the device's connection drops, it reconnects to the same session within a grace
    window (default 20 s), with a resume token from the original `connect`. When the provider
    connection drops, the harness resumes where the provider supports it (Gemini's
@@ -528,32 +538,39 @@ the suite's own output, never an adjective.
 
 **Out, and why:** direct mode (needs §1.6 items 4 and 5 measured), delegation to another harness
 (§5.5, needs the record in production first), telephony (a carrier's media stream is a transport,
-added once the WebSocket transport is measured), cascades (§13, decision 5), and GPT-Live (its
+added once the WebSocket transport is measured), cascades (§13, decision 4), and GPT-Live (its
 delegation model is the second release's subject).
 
 **Naming:** the repository `RealtimeHarness`, the package `realtime_harness`, the CLI `rth`, and the
 HarnessRouter base `realtime`.
 
-## 13. Open decisions
+## 13. Decisions
 
-1. **Relay only in the first release, or direct mode for OpenAI too?** Recommended: relay only. It
-   works for every provider and keeps one code path, and §1.6 will say what direct saves.
-2. **Where the harness runs behind a hosted server:** in the per-task sandbox runner, or in a
-   separate realtime plane. A call is long-lived and runs no shell, and a sandbox per call would add
-   startup time to every call. Recommended: a realtime plane of harness processes, many sessions per
-   process, with no sandbox. A harness whose tools need a sandbox (a local MCP server in a plugin)
-   is refused for this base in the first release.
-3. **Async tools: marked by the owner, or inferred?** Recommended: marked (`asyncTools` on the
-   harness). The owner knows which tool is slow; a guess would make the model announce work that
-   finishes instantly.
-4. **The default `toolTimeoutSeconds`.** 15 s is a guess at what a caller tolerates in silence. It
-   should come from §1.6 item 1, and from listening to calls.
-5. **Cascades** (speech-to-text, any HarnessRouter text model, text-to-speech). Pipecat does them
-   well, and they would put every text model behind a voice. They are a different product, with
-   different latency, and recommended as a separate base after this one.
-6. **Approvals.** A tool that needs a person's approval cannot wait on a voice call. Recommended for
-   the first release: such a tool is not offered in a realtime session, and the record says so.
-   Spoken confirmation ("Shall I send it?") is the model's job, prompted by the instructions.
+Decided in review on 2026-10-27:
+
+1. **Relay only in the first release.** It works for every provider and keeps one code path, and
+   §1.6 will say what direct mode would save.
+2. **Placement behind a hosted server: a realtime plane**, not the per-task sandbox runner. It is a
+   service of harness processes in the same region as the provider endpoint, with many sessions per
+   process and no sandbox. A call is long-lived and runs no shell, and a sandbox per call would add
+   startup time to every call. A harness whose tools need a sandbox (a local MCP server in a
+   plugin) is refused for this base in the first release. The upstream is a separate service (§7).
+3. **Async tools are marked by the owner** (`asyncTools` on the harness), never inferred. The owner
+   knows which tool is slow; a guess would make the model announce work that finishes instantly.
+4. **Cascades** (speech-to-text, any HarnessRouter text model, text-to-speech) are a separate base,
+   after this one. Pipecat does them well, and they would put every text model behind a voice, but
+   they are a different product with different latency.
+5. **Approvals.** A tool that needs a person's approval cannot wait on a voice call. In the first
+   release, such a tool is not offered in a realtime session, and the record says so. Spoken
+   confirmation ("Shall I send it?") is the model's job, prompted by the instructions.
+6. **Providers.** The first release ships Azure OpenAI, OpenAI and Gemini Live. Nova Sonic and Grok
+   Voice follow, each when its row in §10 is measured. GPT-Live and delegation to another harness
+   (§5.5) are the second release.
+
+Still open:
+
+7. **The default `toolTimeoutSeconds`.** 15 s is a guess at what a caller tolerates in silence. It
+   is set from §1.6 item 1, and from listening to calls.
 
 ## 14. Sources
 
