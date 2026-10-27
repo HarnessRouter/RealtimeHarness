@@ -1,7 +1,8 @@
 """One realtime call: the device's audio, the provider's model, the harness's tools, and the record (design §4).
 
-The pipeline is Pipecat's: its FastAPI WebSocket transport carries the device's audio, its realtime service
-speaks the provider's wire, and its context aggregators send the follow-up response after a tool result.
+The pipeline is Pipecat's: its FastAPI WebSocket transport carries the device's audio (over a `DeviceLink`,
+so a dropped device can come back to the same call), its realtime service speaks the provider's wire, and its
+context aggregators send the follow-up response after a tool result.
 What this module adds is what a harness owns (design §2):
 
 - The configuration is the harness's. Instructions, voice and tools are set when the provider connection
@@ -13,6 +14,8 @@ What this module adds is what a harness owns (design §2):
   what the person said (the provider's transcript) as its input, and the turn's function_call,
   function_call_output and message items as its output.
 - The budget: a call ends at the harness's max_call_minutes, with reason `budget`.
+- A call that continues a session starts with what each side said before, as conversation items on the
+  provider (measured on Azure gpt-realtime-2.1: the model answers in audio, from that context).
 
 The device protocol (design §6.2): one WebSocket. Binary messages are PCM16 mono audio at 24 kHz, both
 ways. Text messages are JSON events: from the device, `realtime.input.mute`, `realtime.input.unmute`,
@@ -151,8 +154,14 @@ class CallRecord:
 
     def call_finished(self, call_id: str, result) -> None:
         t = next((x for x in reversed(self.turns) if call_id in x.calls), None)
-        if t is None or any(i.get("type") == "function_call_output" and i.get("call_id") == call_id for i in t.output):
+        if t is None or any(i.get("type") == "function_call_output" and i.get("call_id") == call_id
+                            for x in self.turns for i in x.output):
             return
+        if t.status != "in_progress":
+            # its turn was cut off by the caller while the call ran (design §5.4): the result is recorded in
+            # the turn that takes it, where the model answers it, never after a turn's terminal event
+            self._cancel_ending()
+            t = self.open_turn()
         item = {"id": _id("fco"), "type": "function_call_output", "call_id": call_id,
                 "output": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)}
         t.output.append(item)
@@ -264,12 +273,46 @@ def _serializer_class():
     return _DeviceFrameSerializer
 
 
+def _seeded(cls, earlier: list[dict]):
+    """The provider's realtime service, starting from the session's earlier messages: each is a conversation
+    item, sent once the provider session is configured and before anything is said. Pipecat's own way packs a
+    history into one user message and asks the model to answer it, which speaks first and races the caller."""
+    from pipecat.services.openai.realtime import events as ev
+
+    class Seeded(cls):
+        _rth_seed = list(earlier)
+
+        async def _handle_evt_session_updated(self, evt):
+            seed, self._rth_seed = self._rth_seed, []
+            for m in seed:
+                kind = "output_text" if m["role"] == "assistant" else "input_text"
+                item = ev.ConversationItem(type="message", role=m["role"], content=[ev.ItemContent(type=kind, text=m["content"])])
+                self._messages_added_manually[item.id] = True        # Pipecat's mark for an item it did not hear
+                await self.send_client_event(ev.ConversationItemCreateEvent(item=item))
+            await super()._handle_evt_session_updated(evt)
+
+        async def _handle_context(self, context, direction):
+            if not self._context:
+                # The first context reaches the service after the caller's first words. Pipecat would send them
+                # again as a text item and ask for a response, so the model hears the question twice and
+                # answers twice. The provider already heard the caller and answers on its own turn detection,
+                # and the earlier conversation is seeded above: adopt the context for bookkeeping, send nothing.
+                self._context = context
+                self._llm_needs_conversation_setup = False
+                await self._process_completed_function_calls(send_new_results=False)
+                return
+            await super()._handle_context(context, direction)
+    return Seeded
+
+
 async def provider_service(credentials: Credentials, model: str, settings, tool_timeout_s: float,
-                           opened: list[Connection]):
+                           opened: list[Connection], earlier: list[dict] | None = None):
     """The provider's realtime service for one call. With a server's mint, each connect (the first, and any
     reconnect Pipecat makes) uses a fresh short-lived credential; every one is released when the call ends."""
-    from pipecat.services.azure.realtime.llm import AzureRealtimeLLMService
-    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+    from pipecat.services.azure.realtime.llm import AzureRealtimeLLMService as _Azure
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService as _OpenAI
+    AzureRealtimeLLMService = _seeded(_Azure, earlier or [])
+    OpenAIRealtimeLLMService = _seeded(_OpenAI, earlier or [])
     first = await credentials.connect(model)
     opened.append(first)
     base = first.url.split("?", 1)[0]
@@ -293,8 +336,9 @@ async def provider_service(credentials: Credentials, model: str, settings, tool_
 
 
 def _recorder_class():
-    from pipecat.frames.frames import (FunctionCallInProgressFrame, FunctionCallResultFrame, InterruptionFrame,
-                                       LLMFullResponseEndFrame, MetricsFrame, TranscriptionFrame, TTSTextFrame)
+    from pipecat.frames.frames import (FunctionCallCancelFrame, FunctionCallInProgressFrame, FunctionCallResultFrame,
+                                       InterruptionFrame, LLMFullResponseEndFrame, MetricsFrame, TranscriptionFrame,
+                                       TTSTextFrame)
     from pipecat.metrics.metrics import LLMUsageMetricsData
     from pipecat.observers.base_observer import BaseObserver
 
@@ -325,6 +369,8 @@ def _recorder_class():
                 self.record.call_started(f.tool_call_id, f.function_name, f.arguments)
             elif isinstance(f, FunctionCallResultFrame):
                 self.record.call_finished(f.tool_call_id, f.result)
+            elif isinstance(f, FunctionCallCancelFrame):
+                self.record.call_finished(f.tool_call_id, {"error": "cancelled"})
             elif isinstance(f, MetricsFrame):
                 for d in f.data or []:
                     if isinstance(d, LLMUsageMetricsData):
@@ -350,10 +396,10 @@ def context_messages(history: list[dict]) -> list[dict]:
     return out
 
 
-async def run_call(websocket, *, harness, credentials: Credentials, model: str, record: CallRecord,
+async def run_call(link, *, harness, credentials: Credentials, model: str, record: CallRecord,
                    ended: asyncio.Event, end_reason: list[str], history: list[dict] | None = None) -> None:
-    """Serve one call on an accepted WebSocket until the device hangs up, the client cancels, the budget ends
-    it, or the provider closes. `end_reason[0]` says which."""
+    """Serve one call on the device's link until the device hangs up or does not come back, the client
+    cancels, the budget ends it, or the provider closes. `end_reason[0]` says which."""
     from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
     from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
     from pipecat.frames.frames import InterruptionFrame, OutputTransportMessageUrgentFrame
@@ -408,19 +454,21 @@ async def run_call(websocket, *, harness, credentials: Credentials, model: str, 
                     if harness.transcription_model else None,
                     output=ev.AudioOutput(voice=harness.voice)),
                 tools=functions or None, tool_choice="auto" if functions else None))
-        llm = await provider_service(credentials, model, settings, harness.tool_timeout_seconds, opened)
+        llm = await provider_service(credentials, model, settings, harness.tool_timeout_seconds, opened,
+                                     earlier=context_messages(history or []))
 
         async def run_tool(params) -> None:
             out = await executor.call(params.function_name, dict(params.arguments or {}))
             await params.result_callback(out)
-        llm.register_function(None, run_tool)
+        # a barge-in does not cancel a running tool (design §5.4): the provider answers the caller while the
+        # call is open, and takes the late result afterwards; the result is always recorded
+        llm.register_function(None, run_tool, cancel_on_interruption=False)
 
         serializer = _serializer_class()(on_device_event)
-        transport = FastAPIWebsocketTransport(websocket, FastAPIWebsocketParams(
+        transport = FastAPIWebsocketTransport(link, FastAPIWebsocketParams(
             audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=SAMPLE_RATE,
             audio_out_sample_rate=SAMPLE_RATE, add_wav_header=False, serializer=serializer))
-        earlier = context_messages(history or [])
-        context = LLMContext(earlier, tools) if tools else LLMContext(earlier)
+        context = LLMContext([], tools) if tools else LLMContext([])         # the earlier messages are seeded above
         user_agg, assistant_agg = LLMContextAggregatorPair(context)
         pipeline = Pipeline([transport.input(), user_agg, llm, transport.output(), assistant_agg])
         recorder = _recorder_class()(record, interrupted=lambda: record.end_turn("cancelled") if record.current else None)
@@ -440,7 +488,7 @@ async def run_call(websocket, *, harness, credentials: Credentials, model: str, 
 
         @transport.event_handler("on_client_disconnected")
         async def _gone(_t, _c):
-            finish("hangup")
+            finish(link.end_reason or "hangup")    # a drop pauses inside the link; this is the device gone for good
 
         budget = loop.call_later(harness.max_call_minutes * 60, finish, "budget")
         stop_watch = loop.create_task(_wait_and(ended, lambda: finish(end_reason[0] if end_reason else "hangup")))

@@ -146,6 +146,7 @@ client runs itself. Small samples: these numbers place the design, they are not 
 | The secret's lifetime | Minted for 120 s, the secret still opened a session at 135 s. The expiry bounds starting a call only loosely; it is not a revocation. |
 | Usage | `response.done.usage` per response: `input_tokens` and `output_tokens`, split into text, audio and image tokens, cached input (with its own split), and `reasoning_tokens` when the model reasoned. Checking these against Azure's own billing needs a voice-input session and is still to do. |
 | Session cap | 60 minutes (`session.expires_at` = start + 3,600 s). What the server sends at the cap is still to measure. |
+| A call that starts from earlier turns | Four text items (`input_text` from the user, `output_text` from the assistant) before any audio, then a spoken question about them: the model answered in audio (2.7 s), from that context. Seeding a call's history as items works on this model; Pipecat's alternative, one packed user message that the model is asked to answer, speaks first and races the caller. |
 | Sideband | Not measurable from the client: attaching to a call takes the resource key. Azure's documentation still says nothing; this is measured from the upstream service (§7) when it exists. |
 
 Every other provider in §10 is measured the same way before its row is shipped.
@@ -422,12 +423,15 @@ few event types. It reuses everything else:
 3. **Connecting.** WebRTC: the device POSTs its SDP offer to `connect.url` with the token, and gets
    the answer back (the WHIP pattern). Audio is Opus, and a data channel named `uhp` carries events.
    WebSocket: one socket at `connect.url`, PCM16 frames, with JSON events in the same vocabulary.
+   The first event the device gets is `realtime.session.resume_token`. A device that closes the socket
+   with code 1000 hangs up; any other drop pauses the call (§9, item 2).
 4. **The session's event stream.** `GET /v1/sessions/{id}/events` (SSE, one `sequence_number`
    across the whole call), and the same events on the data channel. Per turn: the existing
    vocabulary. Per call, new and optional: `realtime.session.live`, `realtime.input_transcript.delta`
    / `.done`, `realtime.output_transcript.delta` / `.done`, `realtime.speech_started` (barge-in),
+   `realtime.session.paused` / `.resumed` (the device dropped and came back), and
    `realtime.session.ended` (the terminal event, with `reason`: `hangup`, `budget`, `idle`,
-   `provider_closed`, `error`).
+   `device_lost`, `provider_closed`, `error`).
 5. **Device events.** These narrow only: `realtime.input.mute`, `realtime.input.unmute`,
    `realtime.response.cancel`, `realtime.session.end`. The server ignores any other event from the
    device, and counts it in the record.
@@ -508,7 +512,12 @@ it did not:
    grace period, or, where a call must outlast it, the harness records a planned resume seam at the
    cap (item 2) rather than an unplanned cut.
 2. **Resume.** When the device's connection drops, it reconnects to the same session within a grace
-   window (default 20 s), with a resume token from the original `connect`. When the provider
+   window (default 20 s), with a resume token from the original `connect`. The provider connection is
+   held through the grace, so the conversation is intact and nothing is replayed. What the model says
+   meanwhile is recorded, between `realtime.session.paused` and `.resumed`, and not heard. Each return
+   gets a new token, and a device may return before the server noticed the drop (a half-open
+   connection): the new connection replaces the old one. A device that does not return ends the call
+   with reason `device_lost`. When the provider
    connection drops, the harness resumes where the provider supports it (Gemini's
    `sessionResumption` handle). Otherwise it opens a new provider session seeded with the transcript
    so far, and records the seam.

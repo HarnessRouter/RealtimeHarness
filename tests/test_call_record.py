@@ -109,3 +109,33 @@ def test_a_turn_with_results_in_waits_for_the_answer_to_them():
         assert len(rec.turns) == 1 and rec.turns[0].status == "completed"
         assert rec.turns[0].output[-1]["content"][0]["text"] == "It is clear."
     asyncio.run(go())
+
+
+def test_a_result_that_outlives_its_turn_is_recorded_where_the_model_takes_it():
+    async def go():
+        rec, events = _record()
+        rec.model_said("Checking the order.")
+        rec.call_started("call_o", "order_status", {"order": "4417"})
+        rec.speech_started()
+        rec.end_turn("cancelled")                    # the caller spoke while the call ran
+        rec.user_said("And the weather in Paris?")
+        rec.model_said("It is clear in Paris.")
+        rec.response_ended()
+        await asyncio.sleep(TURN_END_GRACE_S + 0.2)
+        rec.call_finished("call_o", "Order 4417 has shipped.")
+        rec.model_said("Your order has shipped.")
+        rec.response_ended()
+        await asyncio.sleep(TURN_END_GRACE_S + 0.2)
+        first, second, third = rec.turns
+        assert first.status == "cancelled" and [i["type"] for i in first.output] == ["message", "function_call"]
+        assert second.status == "completed"
+        assert [i["type"] for i in third.output] == ["function_call_output", "message"] and third.status == "completed"
+        assert third.output[0]["call_id"] == "call_o"
+        # nothing about a response after its terminal event
+        ended = set()
+        for e in events:
+            rid = e.get("response_id") or (e.get("response") or {}).get("id")
+            assert rid not in ended, e["type"]
+            if e["type"] in ("response.completed", "response.failed", "response.incomplete"):
+                ended.add(rid)
+    asyncio.run(go())

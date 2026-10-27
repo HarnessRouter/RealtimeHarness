@@ -104,20 +104,32 @@ A call adds four endpoints (design §6.2):
 
 | | |
 |---|---|
-| `POST /v1/realtime/sessions` | Makes a call. Returns the session and `connect: {transport, url, token, expires_at}`. The token connects once, within a minute. |
-| `WS /v1/realtime/connect?token=…` | The device's connection. Binary messages are PCM16 mono audio at 24 kHz, both ways. Text messages are JSON events. |
+| `POST /v1/realtime/sessions` | Makes a call. Returns the session and `connect: {transport, url, token, expires_at}`. The token connects once, within a minute. With `previous_response_id`, the call continues that session and starts from what was said in it. |
+| `WS /v1/realtime/connect?token=…` | The device's connection. Binary messages are PCM16 mono audio at 24 kHz, both ways. Text messages are JSON events; the first is `realtime.session.resume_token`. |
 | `GET /v1/sessions/{id}/events` | The call's events (SSE), with one `sequence_number` from 0 across the whole call, ending with `realtime.session.ended`. |
 | `POST /v1/sessions/{id}/cancel` | Hangs up. The session and its turns stay readable (`GET /v1/sessions/{id}`, `GET /v1/responses/{id}`). |
 
-Events, to the client and to the device: `realtime.session.live`, `realtime.speech_started`,
+Events, to the client and to the device: `realtime.session.live`, `realtime.session.paused` and `.resumed`, `realtime.speech_started`,
 `realtime.input_transcript.done`, `realtime.output_transcript.delta` and `.done`, per turn `response.created`,
 `response.output_item.added` and `.done`, `response.completed` (or `response.failed` with status `cancelled`
-after a barge-in), and `realtime.session.ended` with its `reason`: `hangup`, `budget`, `provider_closed` or
-`error`. The device additionally gets `realtime.output_audio.cleared` when the model is cut off, so it drops
+after a barge-in), and `realtime.session.ended` with its `reason`: `hangup`, `budget`, `device_lost`,
+`provider_closed` or `error`. The device additionally gets `realtime.output_audio.cleared` when the model is cut off, so it drops
 the audio it has not played.
 
 From the device, four events are honoured: `realtime.input.mute`, `realtime.input.unmute`,
 `realtime.response.cancel` and `realtime.session.end`. Any other event is ignored and counted in the record.
+
+**A dropped device comes back to the same call.** Closing the socket with code 1000 hangs up. Any other drop
+pauses the call for 20 seconds: the provider connection is held, so the conversation is intact. The device
+reconnects at the same URL with its resume token in place of the connect token, and gets a new one. What the
+model said meanwhile is in the record, between `realtime.session.paused` and `realtime.session.resumed`. A
+device that does not come back ends the call with reason `device_lost`.
+
+**A call and the text around it are one session.** A text turn can continue from a call's turn, and a call
+can start from any turn, with what each side said as the model's context.
+
+**Speaking over the model does not cancel a tool.** The model answers the caller while the tool runs, and the
+tool's result is recorded in the turn where the model takes it.
 
 ## Measured, not implied
 
@@ -136,6 +148,10 @@ was set from them.
 
 The unit tests need no provider key: the tool executor runs against a real MCP server
 ([tests/fixture_mcp.py](tests/fixture_mcp.py)), and the call's record is tested on the events a call produces.
+
+[tests/live/call_checks.py](tests/live/call_checks.py) checks a running server with a provider, one short call
+each: a device that drops and comes back, a call that continues a text turn, and a caller who speaks while a
+slow tool runs. The questions are recorded speech in [tests/fixtures](tests/fixtures).
 
 ## Built on
 

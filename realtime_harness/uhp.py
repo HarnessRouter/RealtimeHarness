@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .call import CallRecord, run_call
+from .device import DeviceLink
 from .config import HarnessConfig
 from .credentials import CredentialError, Credentials
 from .textturn import Listener, TurnResult, run_text_turn
@@ -80,9 +81,11 @@ class Call:
     token: str
     token_expires: float
     record: CallRecord | None = None
-    status: str = "connecting"                    # connecting | live | ended
+    status: str = "connecting"                    # connecting | live | paused | ended
     reason: str | None = None
     token_used: bool = False
+    resume_token: str = ""                        # the device's way back after a dropped connection (R-11)
+    link: DeviceLink | None = None
     events: list[dict] = field(default_factory=list)
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     ended: asyncio.Event = field(default_factory=asyncio.Event)       # asks a live call to end
@@ -97,6 +100,7 @@ class Call:
 
 
 CONNECT_TOKEN_TTL_S = 60
+RESUME_GRACE_S = 20                               # design §9: a dropped device has this long to come back
 
 
 @dataclass
@@ -381,24 +385,56 @@ class Server:
             **({"metadata": {"ignored_fields": ignored}} if ignored else {})}
 
     def claim(self, token: str) -> Call:
-        """A connect token is good for one connection, within its minute (design §6.2)."""
+        """A connect token is good for one connection, within its minute (design §6.2). A resume token is good
+        for one reconnection to a call that is still on: paused within its grace, or live, when the device
+        noticed a dead connection before the server did (R-11)."""
         sid = self.tokens.pop(token, None)
         call = self.calls.get(sid or "")
+        if call is not None and token == call.resume_token:
+            call.resume_token = ""
+            if call.status in ("live", "paused") and call.link is not None and not call.link.end_reason:
+                return call
+            raise UhpError(401, "invalid_credential", "The connect token is not valid.", etype="authentication_error")
         if call is None or call.token_used or time.time() > call.token_expires:
             raise UhpError(401, "invalid_credential", "The connect token is not valid.", etype="authentication_error")
         call.token_used = True
         return call
 
+    def _issue_resume_token(self, call: Call) -> str:
+        if call.resume_token:
+            self.tokens.pop(call.resume_token, None)
+        call.resume_token = secrets.token_urlsafe(32)
+        self.tokens[call.resume_token] = call.session.id
+        return call.resume_token
+
     async def serve_call(self, websocket, call: Call) -> None:
+        # the way back in goes to the device only: it is the device's connection that may drop
+        await websocket.send_text(json.dumps({"type": "realtime.session.resume_token", "token": self._issue_resume_token(call)}))
+        if call.link is not None:
+            # the device is back: the call never stopped, and this connection carries it from here
+            await call.link.attach(websocket).wait()
+            return
+
+        def lost() -> None:
+            call.status = "paused"
+            call.record.event({"type": "realtime.session.paused", "resume_within_seconds": RESUME_GRACE_S})
+
+        def back() -> None:
+            call.status = "live"
+            call.record.event({"type": "realtime.session.resumed"})
+
+        call.link = DeviceLink(websocket, RESUME_GRACE_S, on_lost=lost, on_back=back)
         call.status = "live"
-        await run_call(websocket, harness=call.session.harness, credentials=self.credentials, model=call.model,
+        await run_call(call.link, harness=call.session.harness, credentials=self.credentials, model=call.model,
                        record=call.record, ended=call.ended, end_reason=call.end_reason, history=list(call.session.items))
+        await call.link.close()
         self._close_call(call, call.end_reason[0] if call.end_reason else "hangup")
 
     def _close_call(self, call: Call, reason: str) -> None:
         """The call is over: its turns join the session's history, and the stream ends with its one terminal event."""
         call.reason, call.status = reason, "ended"
         self.tokens.pop(call.token, None)
+        self.tokens.pop(call.resume_token, None)
         for t in call.record.turns:
             call.session.items += [dict(i) for i in t.input] + [dict(i) for i in t.output]
         if call.record.turns:
@@ -482,7 +518,7 @@ class Server:
         s = self.session(sid)
         call = self.calls.get(sid)
         if call is not None:                         # hangs up; the record stays readable
-            if call.status == "live":
+            if call.status in ("live", "paused"):
                 if not call.end_reason:
                     call.end_reason.append("hangup")
                 call.ended.set()

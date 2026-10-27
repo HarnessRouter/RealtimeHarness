@@ -103,3 +103,36 @@ def test_a_call_starts_with_what_each_side_said_before():
                {"type": "function_call_output", "call_id": "c", "output": "{}"},
                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "It is clear."}]}]
     assert context_messages(history) == [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "It is clear."}]
+
+
+def test_a_resume_token_reconnects_once_and_only_to_a_call_that_is_still_on():
+    import asyncio
+
+    from realtime_harness.device import DeviceLink
+    server, c = _app()
+    s = c.post("/v1/realtime/sessions", headers=H, json={}).json()
+    call = server.claim(s["connect"]["token"])
+
+    class Dead:
+        async def receive(self):
+            await asyncio.Event().wait()
+
+    async def go():
+        call.link = DeviceLink(Dead(), 20, on_lost=lambda: None, on_back=lambda: None)
+        call.status = "live"
+        tok = server._issue_resume_token(call)
+        assert server.claim(tok) is call                       # live: the device noticed the drop first
+        try:
+            server.claim(tok)
+            raise AssertionError("a resume token was accepted twice")
+        except UhpError as e:
+            assert e.status == 401
+        tok2 = server._issue_resume_token(call)
+        call.link.end_reason = "device_lost"
+        try:
+            server.claim(tok2)
+            raise AssertionError("a resume token reached a call that is over")
+        except UhpError as e:
+            assert e.status == 401
+        await call.link.close()
+    asyncio.run(go())
