@@ -1,0 +1,307 @@
+{
+  "suite": "tests/live/call_checks.py",
+  "label": "Realtime Harness 0.1.0.dev0, Azure OpenAI gpt-realtime-2.1 through a HarnessRouter server's mint",
+  "date": "2026-10-27",
+  "scenarios": {
+    "discovery": true,
+    "create": true,
+    "narrow": true,
+    "cancel": true,
+    "resume": true,
+    "continue": true,
+    "slow-tool": true,
+    "webrtc": true,
+    "webrtc-resume": true
+  },
+  "checks": {
+    "R-01": {
+      "pass": true,
+      "detail": [
+        {
+          "realtime": true,
+          "transports": [
+            "websocket",
+            "webrtc"
+          ]
+        }
+      ]
+    },
+    "R-02": {
+      "pass": true,
+      "detail": [
+        {
+          "created": 201,
+          "connect": [
+            "expires_at",
+            "token",
+            "transport",
+            "url"
+          ],
+          "unknown harness": 404
+        }
+      ]
+    },
+    "R-03": {
+      "pass": true,
+      "detail": [
+        {
+          "second use of the token": "InvalidStatus",
+          "expiry": "unit test tests/test_realtime_api.py"
+        }
+      ]
+    },
+    "R-04": {
+      "pass": true,
+      "detail": [
+        {
+          "scenario": "narrow",
+          "input": "What is the weather in Paris? Use the weather tool.",
+          "answer": "Paris is clear and about 18 degrees Celsius—pretty pleasant out."
+        },
+        {
+          "scenario": "resume (websocket)",
+          "input": "What is the weather in Paris? Use the weather tool.",
+          "answer": "Paris is clear with a temperature of 18 degrees Celsius."
+        },
+        {
+          "scenario": "webrtc",
+          "input": "What is the weather in Paris? Use the weather tool.",
+          "answer": "Paris is clear and about 18 degrees Celsius. Pretty pleasant out there."
+        },
+        {
+          "scenario": "resume (webrtc)",
+          "input": "What is the weather in Paris? Use the weather tool.",
+          "answer": "Paris is clear and about 18 degrees Celsius. Sounds lovely."
+        }
+      ]
+    },
+    "R-05": {
+      "pass": true,
+      "detail": [
+        {
+          "scenario": "narrow",
+          "call_id": "call_UBAOBQPhNEcbi2yW",
+          "answer": "Paris is clear and about 18 degrees Celsius—pretty pleasant out."
+        },
+        {
+          "scenario": "resume (websocket)",
+          "call_id": "call_UQ48Kg6NDIauq0Li",
+          "answer": "Paris is clear with a temperature of 18 degrees Celsius."
+        },
+        {
+          "scenario": "webrtc",
+          "call_id": "call_P2UgT7gkOQxBCeL9",
+          "answer": "Paris is clear and about 18 degrees Celsius. Pretty pleasant out there."
+        },
+        {
+          "scenario": "resume (webrtc)",
+          "call_id": "call_CwfppJPpZcuzGeBj",
+          "answer": "Paris is clear and about 18 degrees Celsius. Sounds lovely."
+        }
+      ]
+    },
+    "R-06": {
+      "pass": true,
+      "detail": [
+        {
+          "offered": [
+            "weather",
+            "order_status",
+            "broken"
+          ],
+          "disabled server connections": 0
+        }
+      ]
+    },
+    "R-07": {
+      "pass": true,
+      "detail": [
+        {
+          "tool still called": true,
+          "answer": "Paris is clear and about 18 degrees Celsius—pretty pleasant out.",
+          "ignored device events": 2
+        }
+      ]
+    },
+    "R-08": {
+      "pass": true,
+      "detail": [
+        {
+          "cancel": 200,
+          "ended": "hangup",
+          "turn readable": 200
+        }
+      ]
+    },
+    "R-09": {
+      "pass": true,
+      "detail": [
+        {
+          "scenario": "narrow",
+          "events": 45
+        },
+        {
+          "scenario": "cancel",
+          "events": 42
+        },
+        {
+          "scenario": "resume (websocket)",
+          "events": 54
+        },
+        {
+          "scenario": "continue",
+          "events": 15
+        },
+        {
+          "scenario": "slow-tool",
+          "events": 87
+        },
+        {
+          "scenario": "webrtc",
+          "events": 43
+        },
+        {
+          "scenario": "resume (webrtc)",
+          "events": 56
+        }
+      ]
+    },
+    "R-10": {
+      "pass": true,
+      "detail": [
+        {
+          "scenario": "narrow",
+          "usage": [
+            {
+              "input_tokens": 1017,
+              "output_tokens": 235,
+              "total_tokens": 1252,
+              "cache_read_tokens": 768,
+              "input_audio_tokens": 72,
+              "output_audio_tokens": 158
+            }
+          ]
+        },
+        {
+          "scenario": "cancel",
+          "usage": [
+            {
+              "input_tokens": 1014,
+              "output_tokens": 214,
+              "total_tokens": 1228,
+              "cache_read_tokens": 384,
+              "input_audio_tokens": 72,
+              "output_audio_tokens": 142
+            }
+          ]
+        },
+        {
+          "scenario": "resume (websocket)",
+          "usage": [
+            {
+              "input_tokens": 1009,
+              "output_tokens": 196,
+              "total_tokens": 1205,
+              "cache_read_tokens": 768,
+              "input_audio_tokens": 68,
+              "output_audio_tokens": 129
+            },
+            {
+              "input_tokens": 599,
+              "output_tokens": 68,
+              "total_tokens": 667,
+              "cache_read_tokens": 512,
+              "input_audio_tokens": 64,
+              "output_audio_tokens": 41
+            }
+          ]
+        },
+        {
+          "scenario": "continue",
+          "usage": [
+            {
+              "input_tokens": 520,
+              "output_tokens": 87,
+              "total_tokens": 607,
+              "cache_read_tokens": 384,
+              "input_audio_tokens": 29,
+              "output_audio_tokens": 47
+            }
+          ]
+        },
+        {
+          "scenario": "slow-tool",
+          "usage": [
+            {
+              "input_tokens": 497,
+              "output_tokens": 176,
+              "total_tokens": 673,
+              "cache_read_tokens": 0,
+              "input_audio_tokens": 65,
+              "output_audio_tokens": 115
+            },
+            {
+              "input_tokens": 2045,
+              "output_tokens": 455,
+              "total_tokens": 2500,
+              "cache_read_tokens": 1600,
+              "input_audio_tokens": 303,
+              "output_audio_tokens": 219
+            }
+          ]
+        },
+        {
+          "scenario": "webrtc",
+          "usage": [
+            {
+              "input_tokens": 1014,
+              "output_tokens": 231,
+              "total_tokens": 1245,
+              "cache_read_tokens": 768,
+              "input_audio_tokens": 72,
+              "output_audio_tokens": 156
+            }
+          ]
+        },
+        {
+          "scenario": "resume (webrtc)",
+          "usage": [
+            {
+              "input_tokens": 1014,
+              "output_tokens": 238,
+              "total_tokens": 1252,
+              "cache_read_tokens": 512,
+              "input_audio_tokens": 72,
+              "output_audio_tokens": 165
+            },
+            {
+              "input_tokens": 602,
+              "output_tokens": 61,
+              "total_tokens": 663,
+              "cache_read_tokens": 512,
+              "input_audio_tokens": 65,
+              "output_audio_tokens": 37
+            }
+          ]
+        }
+      ]
+    },
+    "R-11": {
+      "pass": true,
+      "detail": [
+        {
+          "transport": "websocket",
+          "after the return": "You asked about Paris."
+        },
+        {
+          "transport": "webrtc",
+          "after the return": "You asked about Paris."
+        }
+      ]
+    }
+  },
+  "summary": {
+    "pass": 11,
+    "fail": 0
+  }
+}

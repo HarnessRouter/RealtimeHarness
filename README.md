@@ -40,6 +40,7 @@ This is the first slice, not a release.
 | Provider | Azure OpenAI (`gpt-realtime-2.1`), on the OpenAI realtime wire. OpenAI direct uses the same path and has not been measured yet. Gemini Live, Nova Sonic and Grok Voice follow, each when it is measured (design §10). |
 | Transport | WebSocket (PCM16 audio and JSON events), and WebRTC (Opus audio, events on a data channel) with the `webrtc` extra. |
 | UHP | **Core, 40/40** on text turns ([report](docs/reports/uhp-conformance-core-2026-10-27.json)). The Realtime chapter is implemented as proposed in design §6 and is not yet part of a published UHP version. |
+| Realtime checks | **R-01 to R-11, 11/11** on Azure OpenAI `gpt-realtime-2.1`, over WebSocket and WebRTC ([report](docs/reports/realtime-checks-2026-10-27.json), from [tests/live/call_checks.py](tests/live/call_checks.py); the checks are design §11). |
 | Tools | MCP servers over Streamable HTTP or SSE. |
 
 ## Quickstart
@@ -164,10 +165,10 @@ realtime wire ([tests/fake_provider.py](tests/fake_provider.py)), which answers 
 conversation holds: a call's record, a device that cannot change the configuration, a device that drops and
 comes back, and a provider that drops and is replaced, each in about two seconds.
 
-[tests/live/call_checks.py](tests/live/call_checks.py) checks a running server with a provider, one short call
-each: a device that drops and comes back (over WebSocket and over WebRTC), a call that continues a text turn,
-a caller who speaks while a slow tool runs, and a call over WebRTC. The questions are recorded speech in
-[tests/fixtures](tests/fixtures).
+[tests/live/call_checks.py](tests/live/call_checks.py) checks a running server with a provider, serving
+[tests/live/realtime-checks.yaml](tests/live/realtime-checks.yaml): design §11's checks R-01 to R-11, one short
+call each, over WebSocket and WebRTC, and writes a report with `--report <file>`. The questions are recorded
+speech in [tests/fixtures](tests/fixtures).
 
 ## Built on
 

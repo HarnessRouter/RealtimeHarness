@@ -7,6 +7,7 @@ order. It answers from what its conversation holds, so a test can tell whether t
 - anything else: "Hello."
 
 `drop_after` closes a connection, without a close frame, after that many answers on it: a provider that goes.
+`refuse_after` sends an `error` event (a refused request) after that many answers, and carries on.
 """
 from __future__ import annotations
 
@@ -34,9 +35,11 @@ def _tone(seconds: float) -> bytes:
 
 
 class FakeRealtime:
-    def __init__(self, utterances: list[str], drop_after: int | None = None):
+    def __init__(self, utterances: list[str], drop_after: int | None = None, refuse_after: int | None = None):
         self.utterances = list(utterances)
         self.drop_after = drop_after
+        self.refuse_after = refuse_after
+        self.refused = 0
         self.connections = 0
         self.dropped = 0
         self.sessions: list[dict] = []          # per connection: what it was told and what it holds
@@ -78,6 +81,10 @@ class FakeRealtime:
                     await self._hear(s, send, base64.b64decode(m.get("audio") or ""))
                 elif t == "response.create":
                     await self._respond(s, send)
+                if self.refuse_after is not None and s["answers"] >= self.refuse_after and self.refused < 1:
+                    self.refused += 1
+                    await send({"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_value",
+                                                           "message": "Audio content of 5200ms is already shorter than 5993ms"}})
                 if self.drop_after is not None and s["answers"] >= self.drop_after and self.dropped < 1:
                     self.dropped += 1
                     await asyncio.sleep(0.3)            # what was sent reaches the harness first

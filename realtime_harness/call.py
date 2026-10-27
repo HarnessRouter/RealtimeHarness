@@ -251,7 +251,9 @@ def _seeded(cls, earlier: list[dict], connections: "Callable[[], Awaitable[Conne
       message and asks the model to answer it, which speaks first and races the caller.
     - Every connection, the first and any after a drop, authenticates with a fresh credential from the
       harness's credentials (a server's mint gives one per connection).
-    - A provider connection that ends without the harness ending it calls `_rth_dropped`."""
+    - A provider connection that ends without the harness ending it calls `_rth_dropped`.
+    - A request the provider refuses (an `error` event) does not end the connection. Pipecat stops reading at
+      any error, so one refused request (a barge-in's truncate, measured on Azure) left the call deaf."""
     from pipecat.services.openai.realtime import events as ev
 
     class Seeded(cls):
@@ -281,6 +283,15 @@ def _seeded(cls, earlier: list[dict], connections: "Callable[[], Awaitable[Conne
                 await self._process_completed_function_calls(send_new_results=False)
                 return
             await super()._handle_context(context, direction)
+
+        async def _maybe_handle_evt_retrieve_conversation_item_error(self, evt) -> bool:
+            if await super()._maybe_handle_evt_retrieve_conversation_item_error(evt):
+                return True
+            # On the OpenAI realtime wire the session goes on after an error event; only the socket closing
+            # ends it, and that is handled as a drop. Report it, and keep reading.
+            err = getattr(evt, "error", None)
+            await self.push_error(error_msg=f"The provider refused a request ({getattr(err, 'code', None) or getattr(err, 'type', None)}).")
+            return True
 
         async def _receive_task_handler(self):
             try:

@@ -1,0 +1,13 @@
+# The harness the live checks run against (tests/live/call_checks.py): the fixture MCP server with one tool
+# disabled, and a disabled server the checks listen on, to see that it is never contacted (R-06).
+id: weather-desk
+name: Weather desk
+instructions: You are a helpful assistant. Use the weather tool for weather questions. Keep your answers short.
+tool_timeout_seconds: 10
+mcp_servers:
+  - name: fixture
+    url: http://127.0.0.1:18933/mcp
+    disabled_tools: [delete_account]
+  - name: trap
+    url: http://127.0.0.1:18934/mcp
+    enabled: false

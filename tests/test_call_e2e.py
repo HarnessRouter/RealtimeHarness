@@ -183,3 +183,20 @@ def test_a_provider_that_drops_is_replaced_and_the_new_one_knows_what_was_said(m
         assert p.said(rec["responses"][-1]) == "You asked about Tokyo."        # from the seeded transcript
         assert p.events[-1]["reason"] == "hangup"
     asyncio.run(go())
+
+
+def test_a_refused_request_does_not_end_the_providers_connection(mcp_url):
+    async def go():
+        fake = FakeRealtime(["What is the weather in Paris?", "Which city did I just ask about?"], refuse_after=1)
+        async with serving(mcp_url, fake) as (base, server, creds):
+            p = await Phone(base).call()
+            await p.say()
+            await p.answers(1)
+            await asyncio.sleep(0.3)                                  # the refusal arrives after the answer
+            await p.say()
+            await p.answers(2)
+            rec = await p.hang_up()
+        assert fake.refused == 1 and fake.connections == 1 and creds.minted == 1
+        assert not any(e["type"] == "realtime.session.provider_reconnected" for e in p.events)
+        assert p.said(rec["responses"][-1]) == "You asked about Paris."
+    asyncio.run(go())
