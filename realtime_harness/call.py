@@ -31,7 +31,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .credentials import Connection, Credentials
 from .device import SAMPLE_RATE
@@ -44,6 +44,9 @@ TURN_END_GRACE_S = 0.6
 # A turn whose last item is a tool's result waits for the model's answer to it, which comes in the provider's
 # next response; this bounds that wait for a model that never answers.
 ANSWER_WAIT_S = 20.0
+# A provider connection that drops mid-call is replaced this many times per call (design §9 item 2), each new
+# one seeded with what was said so far; after that the call ends with reason `provider_closed`.
+MAX_PROVIDER_RECONNECTS = 2
 DEVICE_EVENTS = {"realtime.input.mute", "realtime.input.unmute", "realtime.response.cancel", "realtime.session.end"}
 
 
@@ -211,6 +214,16 @@ class CallRecord:
             return
         self.end_turn("completed")
 
+    def provider_lost(self) -> None:
+        """The provider's connection dropped: a turn it had finished answering (only the end-of-turn grace was
+        left) is complete; a turn it was still producing is cut off, and fails."""
+        t = self.current
+        if t is None:
+            return
+        answered = (self._ending is not None and not t.calls_pending()
+                    and bool(t.output) and t.output[-1].get("type") == "message")
+        self.end_turn("completed" if answered else "failed")
+
     def end_turn(self, status: str = "completed") -> None:
         self._cancel_ending()
         t = self.current
@@ -223,14 +236,23 @@ class CallRecord:
         self.event({"type": terminal, "response": self.response_dict(t)})
 
 
-def _seeded(cls, earlier: list[dict]):
-    """The provider's realtime service, starting from the session's earlier messages: each is a conversation
-    item, sent once the provider session is configured and before anything is said. Pipecat's own way packs a
-    history into one user message and asks the model to answer it, which speaks first and races the caller."""
+def _seeded(cls, earlier: list[dict], connections: "Callable[[], Awaitable[Connection]]"):
+    """The provider's realtime service as this harness runs it:
+
+    - It starts from the session's earlier messages: each is a conversation item, sent once the provider
+      session is configured and before anything is said. Pipecat's own way packs a history into one user
+      message and asks the model to answer it, which speaks first and races the caller.
+    - Every connection, the first and any after a drop, authenticates with a fresh credential from the
+      harness's credentials (a server's mint gives one per connection).
+    - A provider connection that ends without the harness ending it calls `_rth_dropped`."""
     from pipecat.services.openai.realtime import events as ev
 
     class Seeded(cls):
         _rth_seed = list(earlier)
+        _rth_dropped = None
+
+        async def _auth_headers(self) -> dict[str, str]:
+            return dict((await connections()).headers)
 
         async def _handle_evt_session_updated(self, evt):
             seed, self._rth_seed = self._rth_seed, []
@@ -252,37 +274,41 @@ def _seeded(cls, earlier: list[dict]):
                 await self._process_completed_function_calls(send_new_results=False)
                 return
             await super()._handle_context(context, direction)
+
+        async def _receive_task_handler(self):
+            try:
+                await super()._receive_task_handler()
+            except Exception:  # noqa: BLE001  # the provider's connection failed: the same as it closing
+                pass
+            if not self._disconnecting and self._rth_dropped is not None:
+                # not from inside this task: reconnecting cancels it
+                asyncio.get_running_loop().create_task(self._rth_dropped())
     return Seeded
 
 
 async def provider_service(credentials: Credentials, model: str, settings, tool_timeout_s: float,
                            opened: list[Connection], earlier: list[dict] | None = None):
-    """The provider's realtime service for one call. With a server's mint, each connect (the first, and any
-    reconnect Pipecat makes) uses a fresh short-lived credential; every one is released when the call ends."""
-    from pipecat.services.azure.realtime.llm import AzureRealtimeLLMService as _Azure
-    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService as _OpenAI
-    AzureRealtimeLLMService = _seeded(_Azure, earlier or [])
-    OpenAIRealtimeLLMService = _seeded(_OpenAI, earlier or [])
+    """The provider's realtime service for one call. Each connection uses a fresh credential from the
+    harness's credentials, and every one is recorded in `opened`, to be released."""
+    from pipecat.services.azure.realtime.llm import AzureRealtimeLLMService
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
     first = await credentials.connect(model)
     opened.append(first)
+    ready = [first]
+
+    async def connections() -> Connection:
+        if ready:
+            return ready.pop()
+        nxt = await credentials.connect(model)
+        opened.append(nxt)
+        return nxt
     base = first.url.split("?", 1)[0]
     settings.model = first.model
     timeout = tool_timeout_s + 5          # the executor's own limit answers first; this is only a backstop
-    if "Authorization" in first.headers:
-        tokens = [first.headers["Authorization"].split(" ", 1)[1]]
-
-        async def token_provider() -> str:
-            if tokens:
-                return tokens.pop()
-            nxt = await credentials.connect(model)
-            opened.append(nxt)
-            return nxt.headers["Authorization"].split(" ", 1)[1]
-        if ".azure.com" in base:
-            return AzureRealtimeLLMService(base_url=base, token_provider=token_provider, settings=settings,
-                                           function_call_timeout_secs=timeout)
-        return OpenAIRealtimeLLMService(api_key=tokens[0], base_url=base, settings=settings, function_call_timeout_secs=timeout)
-    return AzureRealtimeLLMService(base_url=base, api_key=first.headers.get("api-key"), settings=settings,
-                                   function_call_timeout_secs=timeout)
+    cls = AzureRealtimeLLMService if ".azure.com" in base else OpenAIRealtimeLLMService
+    # the key passed here is never sent: every connection authenticates through `connections`
+    return _seeded(cls, earlier or [], connections)(api_key="per-connection", base_url=base, settings=settings,
+                                                    function_call_timeout_secs=timeout)
 
 
 def _recorder_class():
@@ -385,6 +411,12 @@ async def run_call(device, *, harness, credentials: Credentials, model: str, rec
 
     executor = ToolExecutor(harness)
     opened: list[Connection] = []
+    released: set[int] = set()
+
+    async def release(c: Connection) -> None:
+        if id(c) not in released:
+            released.add(id(c))
+            await credentials.release(c)
     worker: PipelineWorker | None = None
     loop = asyncio.get_running_loop()
 
@@ -435,6 +467,32 @@ async def run_call(device, *, harness, credentials: Credentials, model: str, rec
         # call is open, and takes the late result afterwards; the result is always recorded
         llm.register_function(None, run_tool, cancel_on_interruption=False)
 
+        reconnects = 0
+
+        async def provider_dropped() -> None:
+            """The provider's connection ended without the harness ending it (design §9 item 2): what was being
+            said is cut off, the dropped connection is released at once (its meter stops), and a new one starts
+            from what was said so far. The record holds the seam."""
+            nonlocal reconnects
+            if end_reason:
+                return
+            record.provider_lost()
+            await release(opened[-1])
+            if reconnects >= MAX_PROVIDER_RECONNECTS:
+                finish("provider_closed")
+                return
+            reconnects += 1
+            said = list(history or []) + [dict(i) for t in record.turns for i in t.input + t.output]
+            llm._rth_seed = context_messages(said)
+            await llm._disconnect()
+            llm._llm_needs_conversation_setup = False          # seeded as items, not Pipecat's packed message
+            await llm._connect()
+            if llm._websocket is None:
+                finish("provider_closed")
+                return
+            record.event({"type": "realtime.session.provider_reconnected", "seeded_messages": len(llm._rth_seed)})
+        llm._rth_dropped = provider_dropped
+
         transport = device.transport(on_device_event, finish)
         context = LLMContext([], tools) if tools else LLMContext([])         # the earlier messages are seeded above
         user_agg, assistant_agg = LLMContextAggregatorPair(context)
@@ -475,8 +533,8 @@ async def run_call(device, *, harness, credentials: Credentials, model: str, rec
     finally:
         if record.current is not None:
             record.end_turn("cancelled")
-        for c in opened:
-            await credentials.release(c)
+        for c in list(opened):
+            await release(c)
         await executor.close()
 
 

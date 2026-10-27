@@ -153,8 +153,8 @@ class DeviceLink:
                 await ws.send_bytes(bytes(data))
             else:
                 await ws.send_text(data)
-        except Exception:  # noqa: BLE001  # a connection that fails to write has dropped
-            self._lose(ws)
+        except Exception:  # noqa: BLE001  # the connection is ending: its reader says how (a hang-up or a drop)
+            pass
 
     def _lose(self, ws) -> None:
         if ws is not self._ws or self._closed:

@@ -113,3 +113,16 @@ def test_ending_the_call_releases_the_device_connection():
         assert done_b.is_set() and b.closed_with == 1000
         assert (await asyncio.wait_for(link.receive(), 1))["type"] == "websocket.disconnect"
     asyncio.run(go())
+
+
+
+def test_a_write_that_fails_as_the_device_hangs_up_is_still_a_hang_up():
+    async def go():
+        a = FakeSocket()
+        link, seen = _link(a)
+        a.closed_with = 1000                       # the device's close frame is in, our audio write fails
+        await link.send_bytes(b"audio")
+        a.drops(1000)
+        msg = await asyncio.wait_for(link.receive(), 1)
+        assert msg["type"] == "websocket.disconnect" and link.end_reason == "hangup" and seen == []
+    asyncio.run(go())

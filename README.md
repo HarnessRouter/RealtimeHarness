@@ -110,7 +110,8 @@ A call adds four endpoints (design §6.2):
 | `GET /v1/sessions/{id}/events` | The call's events (SSE), with one `sequence_number` from 0 across the whole call, ending with `realtime.session.ended`. |
 | `POST /v1/sessions/{id}/cancel` | Hangs up. The session and its turns stay readable (`GET /v1/sessions/{id}`, `GET /v1/responses/{id}`). |
 
-Events, to the client and to the device: `realtime.session.live`, `realtime.session.paused` and `.resumed`, `realtime.speech_started`,
+Events, to the client and to the device: `realtime.session.live`, `realtime.session.paused` and `.resumed`,
+`realtime.session.provider_reconnected`, `realtime.speech_started`,
 `realtime.input_transcript.done`, `realtime.output_transcript.delta` and `.done`, per turn `response.created`,
 `response.output_item.added` and `.done`, `response.completed` (or `response.failed` with status `cancelled`
 after a barge-in), and `realtime.session.ended` with its `reason`: `hangup`, `budget`, `device_lost`,
@@ -129,6 +130,11 @@ the record, between `realtime.session.paused` and `realtime.session.resumed`. A 
 back ends the call with reason `device_lost`.
 
 Behind a NAT, give the server STUN servers for WebRTC in `RTH_ICE_SERVERS` (comma separated).
+
+**A provider that drops is replaced.** If the provider's connection ends mid-call, the harness releases it at
+once (its meter stops), opens a new one that starts from what was said so far, and records the seam as
+`realtime.session.provider_reconnected`. A turn the drop cut off fails; after two replacements the call ends
+with reason `provider_closed`.
 
 **A call and the text around it are one session.** A text turn can continue from a call's turn, and a call
 can start from any turn, with what each side said as the model's context.
@@ -151,8 +157,11 @@ was set from them.
 .venv/bin/python -m pytest -q
 ```
 
-The unit tests need no provider key: the tool executor runs against a real MCP server
-([tests/fixture_mcp.py](tests/fixture_mcp.py)), and the call's record is tested on the events a call produces.
+The tests need no provider key. The tool executor runs against a real MCP server
+([tests/fixture_mcp.py](tests/fixture_mcp.py)). Whole calls run against a scripted provider on the OpenAI
+realtime wire ([tests/fake_provider.py](tests/fake_provider.py)), which answers only from what its
+conversation holds: a call's record, a device that cannot change the configuration, a device that drops and
+comes back, and a provider that drops and is replaced, each in about two seconds.
 
 [tests/live/call_checks.py](tests/live/call_checks.py) checks a running server with a provider, one short call
 each: a device that drops and comes back (over WebSocket and over WebRTC), a call that continues a text turn,

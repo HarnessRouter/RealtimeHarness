@@ -432,7 +432,8 @@ few event types. It reuses everything else:
    across the whole call), and the same events on the data channel. Per turn: the existing
    vocabulary. Per call, new and optional: `realtime.session.live`, `realtime.input_transcript.delta`
    / `.done`, `realtime.output_transcript.delta` / `.done`, `realtime.speech_started` (barge-in),
-   `realtime.session.paused` / `.resumed` (the device dropped and came back), and
+   `realtime.session.paused` / `.resumed` (the device dropped and came back),
+   `realtime.session.provider_reconnected` (the provider's connection was replaced, §9), and
    `realtime.session.ended` (the terminal event, with `reason`: `hangup`, `budget`, `idle`,
    `device_lost`, `provider_closed`, `error`).
 5. **Device events.** These narrow only: `realtime.input.mute`, `realtime.input.unmute`,
@@ -523,7 +524,10 @@ it did not:
    with reason `device_lost`. When the provider
    connection drops, the harness resumes where the provider supports it (Gemini's
    `sessionResumption` handle). Otherwise it opens a new provider session seeded with the transcript
-   so far, and records the seam.
+   so far, and records the seam. On the OpenAI wire: the dropped connection's credential is released at
+   once, the turn the drop cut off fails, the new session gets what each side said as conversation
+   items, and the stream carries `realtime.session.provider_reconnected`. Two replacements per call,
+   then the call ends with `provider_closed`.
 3. **Fail fast at connect.** A device connect that gets no answer within 5 s retries once, then
    reports the failure. An ingress with no ready backend can hold a connection for 30 s, and on a
    voice call that reads as a dead line.

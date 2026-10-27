@@ -1,39 +1,10 @@
 """The tool executor against a real MCP server (tests/fixture_mcp.py over Streamable HTTP): what is offered,
 what is never contacted, and that every call is answered (design §5, UHP Harnesses §4.1 and §4.3)."""
 import asyncio
-import pathlib
 import socket
-import subprocess
-import sys
-import time
-
-import pytest
 
 from realtime_harness.config import HarnessConfig, McpServer
 from realtime_harness.tools import ToolExecutor
-
-FIXTURE = pathlib.Path(__file__).with_name("fixture_mcp.py")
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture(scope="module")
-def mcp_url():
-    port = _free_port()
-    proc = subprocess.Popen([sys.executable, str(FIXTURE), str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1", port)) == 0:
-                break
-        time.sleep(0.1)
-    yield f"http://127.0.0.1:{port}/mcp"
-    proc.terminate()
-    proc.wait(timeout=5)
 
 
 def _run(coro):

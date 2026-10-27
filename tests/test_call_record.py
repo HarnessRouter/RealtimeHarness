@@ -143,3 +143,16 @@ def test_a_result_that_outlives_its_turn_is_recorded_where_the_model_takes_it():
             if e["type"] in ("response.completed", "response.failed", "response.incomplete"):
                 ended.add(rid)
     asyncio.run(go())
+
+
+def test_a_provider_drop_fails_a_turn_it_cut_off_and_keeps_one_it_had_answered():
+    async def go():
+        rec, _ = _record()
+        rec.model_said("It is clear.")
+        rec.response_ended()                       # answered; only the end-of-turn grace is left
+        rec.provider_lost()
+        rec.model_said("Let me check")             # the next turn, cut off mid-sentence
+        rec.provider_lost()
+        assert [t.status for t in rec.turns] == ["completed", "failed"]
+        assert rec.turns[1].output[0]["status"] == "incomplete"
+    asyncio.run(go())
