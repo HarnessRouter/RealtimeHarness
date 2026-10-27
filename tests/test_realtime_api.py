@@ -26,7 +26,7 @@ def _app():
 def test_discovery_advertises_realtime_and_its_transport():
     _, c = _app()
     d = c.get("/v1/uhp").json()
-    assert d["capabilities"]["realtime"] is True and d["realtime_transports"] == ["websocket"]
+    assert d["capabilities"]["realtime"] is True and d["realtime_transports"][0] == "websocket"
     assert d["capabilities"]["environments"] is False and d["capabilities"]["memories"] is False   # false, not omitted
 
 
@@ -118,7 +118,7 @@ def test_a_resume_token_reconnects_once_and_only_to_a_call_that_is_still_on():
             await asyncio.Event().wait()
 
     async def go():
-        call.link = DeviceLink(Dead(), 20, on_lost=lambda: None, on_back=lambda: None)
+        call.device = DeviceLink(Dead(), 20, on_lost=lambda: None, on_back=lambda: None)
         call.status = "live"
         tok = server._issue_resume_token(call)
         assert server.claim(tok) is call                       # live: the device noticed the drop first
@@ -128,11 +128,60 @@ def test_a_resume_token_reconnects_once_and_only_to_a_call_that_is_still_on():
         except UhpError as e:
             assert e.status == 401
         tok2 = server._issue_resume_token(call)
-        call.link.end_reason = "device_lost"
+        call.device.end_reason = "device_lost"
         try:
             server.claim(tok2)
             raise AssertionError("a resume token reached a call that is over")
         except UhpError as e:
             assert e.status == 401
-        await call.link.close()
+        await call.device.close()
+    asyncio.run(go())
+
+
+def test_each_transport_connects_at_its_own_kind_of_url_and_only_there():
+    from realtime_harness import webrtc
+    _, c = _app()
+    ws = c.post("/v1/realtime/sessions", headers=H, json={}).json()
+    assert ws["connect"]["url"].startswith("ws://")
+    if not webrtc.available():
+        r = c.post("/v1/realtime/sessions", headers=H, json={"transport": "webrtc"})
+        assert r.status_code == 400 and r.json()["error"]["param"] == "transport"
+        return
+    rtc = c.post("/v1/realtime/sessions", headers=H, json={"transport": "webrtc"}).json()
+    assert rtc["connect"]["transport"] == "webrtc" and rtc["connect"]["url"].startswith("http://")
+    # a WebSocket call's token does not answer an offer, and an offer must be SDP
+    r = c.post(f"/v1/realtime/connect?token={ws['connect']['token']}", content="v=0\r\n",
+               headers={"Content-Type": "application/sdp"})
+    assert r.status_code == 400 and r.json()["error"]["param"] == "transport"
+    r = c.post(f"/v1/realtime/connect?token={rtc['connect']['token']}", content="hello",
+               headers={"Content-Type": "application/sdp"})
+    assert r.status_code == 400
+    r = c.post("/v1/realtime/connect?token=nope", content="v=0\r\n", headers={"Content-Type": "application/sdp"})
+    assert r.status_code == 401
+    # and a WebRTC call's token does not open a WebSocket
+    rtc2 = c.post("/v1/realtime/sessions", headers=H, json={"transport": "webrtc"}).json()
+    from starlette.websockets import WebSocketDisconnect
+    try:
+        with c.websocket_connect(f"/v1/realtime/connect?token={rtc2['connect']['token']}") as s:
+            s.receive_text()
+        raise AssertionError("a WebRTC call opened a WebSocket")
+    except WebSocketDisconnect as e:
+        assert e.code == 4400
+
+
+def test_a_closed_peer_connections_pending_writes_are_settled():
+    import asyncio
+    from collections import deque
+
+    from realtime_harness.webrtc import _settle
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        done, pending = loop.create_future(), loop.create_future()
+        done.set_result(True)
+        track = type("T", (), {})()
+        track._chunk_queue = deque([(b"a", None), (b"b", done), (b"c", pending)])
+        _settle(track)
+        assert pending.done() and not track._chunk_queue
+        _settle(None)                                   # nothing connected yet
     asyncio.run(go())

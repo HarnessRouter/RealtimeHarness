@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
+# calls over WebRTC (Opus audio, a data channel for events): Pipecat's SmallWebRTC transport, on aiortc
+webrtc = ["aiortc>=1.14,<2"]
 
 [project.scripts]
 rth = "realtime_harness.cli:main"

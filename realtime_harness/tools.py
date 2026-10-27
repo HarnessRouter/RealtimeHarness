@@ -98,7 +98,7 @@ class ToolExecutor:
             state = self.servers[cfg.name]
             try:
                 session, listed = await ready[cfg.name]
-            except Exception as e:  # noqa: BLE001: an unreachable server does not fail the call
+            except Exception as e:  # noqa: BLE001  # an unreachable server does not fail the call
                 state.error = f"unreachable: {type(e).__name__}"
                 self.left_out[f"server:{cfg.name}"] = state.error
                 continue
@@ -127,7 +127,7 @@ class ToolExecutor:
                     listed = await session.list_tools()
                 ready.set_result((session, listed))
                 await state.stop.wait()
-        except BaseException as e:  # noqa: BLE001: reported through `ready`; a closing call ends here too
+        except BaseException as e:  # noqa: BLE001  # reported through `ready`; a closing call ends here too
             if not ready.done():
                 ready.set_exception(e if isinstance(e, Exception) else RuntimeError(type(e).__name__))
 
@@ -169,7 +169,7 @@ class ToolExecutor:
             result = await asyncio.wait_for(session.call_tool(tool.remote_name, arguments), timeout)
         except asyncio.TimeoutError:
             return {"error": "timeout", "detail": f"the tool did not answer within {timeout:g} second{'' if timeout == 1 else 's'}"}
-        except Exception as e:  # noqa: BLE001: the model is told, and the record keeps it
+        except Exception as e:  # noqa: BLE001  # the model is told, and the record keeps it
             return {"error": "tool_error", "detail": f"{type(e).__name__}: {str(e)[:300]}"}
         text = output_text(result)
         if getattr(result, "is_error", False):

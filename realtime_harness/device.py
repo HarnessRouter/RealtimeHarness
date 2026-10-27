@@ -16,11 +16,13 @@ cannot hold up the next.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Callable
 
 from starlette.websockets import WebSocketState
 
+SAMPLE_RATE = 24000
 NORMAL_CLOSURE = 1000
 _DISCONNECT = {"type": "websocket.disconnect", "code": NORMAL_CLOSURE}
 
@@ -98,6 +100,18 @@ class DeviceLink:
         for done in self._done.values():
             done.set()
 
+    def transport(self, on_device_event: Callable[[dict], None], finish: Callable[[str], None]):
+        """Pipecat's WebSocket transport on this link, with the device protocol's serializer."""
+        from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
+        t = FastAPIWebsocketTransport(self, FastAPIWebsocketParams(
+            audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=SAMPLE_RATE,
+            audio_out_sample_rate=SAMPLE_RATE, add_wav_header=False, serializer=_serializer_class()(on_device_event)))
+
+        @t.event_handler("on_client_disconnected")
+        async def _gone(_t, _c):
+            finish(self.end_reason or "hangup")    # a drop pauses inside the link; this is the device gone for good
+        return t
+
     # ── what the server uses ─────────────────────────────────────────────────────────────────
     def attach(self, websocket) -> asyncio.Event:
         """Make this connection the device's. Returns an event set when it is no longer the device's (it
@@ -127,7 +141,7 @@ class DeviceLink:
                     return
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001: a connection that fails to read has dropped
+        except Exception:  # noqa: BLE001  # a connection that fails to read has dropped
             await self._q.put((ws, {"type": "websocket.disconnect", "code": 1006}))
 
     async def _send(self, data) -> None:
@@ -139,7 +153,7 @@ class DeviceLink:
                 await ws.send_bytes(bytes(data))
             else:
                 await ws.send_text(data)
-        except Exception:  # noqa: BLE001: a connection that fails to write has dropped
+        except Exception:  # noqa: BLE001  # a connection that fails to write has dropped
             self._lose(ws)
 
     def _lose(self, ws) -> None:
@@ -158,8 +172,59 @@ class DeviceLink:
             done.set()
 
 
+class DeviceSerializer:
+    """The device protocol over Pipecat's FastAPI WebSocket transport: PCM16 audio as binary, events as JSON."""
+
+    def __init__(self, on_device_event: Callable[[dict], None]):
+        from pipecat.serializers.base_serializer import FrameSerializer  # noqa: F401  # the interface implemented
+        self.on_device_event = on_device_event
+
+    async def setup(self, setup) -> None:
+        return None
+
+    def should_ignore_frame(self, frame) -> bool:
+        return False
+
+    async def serialize(self, frame):
+        from pipecat.frames.frames import (AudioRawFrame, InterruptionFrame, OutputTransportMessageFrame,
+                                           OutputTransportMessageUrgentFrame)
+        if isinstance(frame, AudioRawFrame):
+            return frame.audio
+        if isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
+            return json.dumps(frame.message, ensure_ascii=False)
+        if isinstance(frame, InterruptionFrame):
+            # the model was cut off: the device drops the audio it has queued and not yet played
+            return json.dumps({"type": "realtime.output_audio.cleared"})
+        return None
+
+    async def deserialize(self, data):
+        from pipecat.frames.frames import InputAudioRawFrame
+        if isinstance(data, (bytes, bytearray)):
+            if not data:
+                return None
+            return InputAudioRawFrame(audio=bytes(data), sample_rate=SAMPLE_RATE, num_channels=1)
+        try:
+            ev = json.loads(data)
+        except (ValueError, TypeError):
+            ev = {}
+        self.on_device_event(ev if isinstance(ev, dict) else {})
+        return None
+
+
+def _serializer_class():
+    """DeviceSerializer as a Pipecat FrameSerializer subclass (built lazily, so importing this module does not
+    import Pipecat)."""
+    from pipecat.serializers.base_serializer import FrameSerializer
+
+    class _DeviceFrameSerializer(DeviceSerializer, FrameSerializer):
+        def __init__(self, on_device_event):
+            FrameSerializer.__init__(self)
+            DeviceSerializer.__init__(self, on_device_event)
+    return _DeviceFrameSerializer
+
+
 async def _quiet_close(ws, code: int) -> None:
     try:
         await asyncio.wait_for(ws.close(code=code), 2)
-    except Exception:  # noqa: BLE001: a dead connection may not close cleanly; it is gone either way
+    except Exception:  # noqa: BLE001  # a dead connection may not close cleanly; it is gone either way
         pass

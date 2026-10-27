@@ -3,7 +3,8 @@ what the model said, every tool call and its result; the stream is gapless; a ba
 import asyncio
 import json
 
-from realtime_harness.call import TURN_END_GRACE_S, CallRecord, DeviceSerializer
+from realtime_harness.call import TURN_END_GRACE_S, CallRecord
+from realtime_harness.device import DeviceSerializer
 
 
 def _record():
@@ -81,16 +82,19 @@ def test_a_barge_in_cancels_the_turn_and_the_next_words_open_another():
 
 def test_the_device_narrows_a_call_and_never_widens_it():
     async def go():
+        from realtime_harness.call import _gate_class
         seen = []
         s = DeviceSerializer(seen.append)
         frame = await s.deserialize(b"\x01\x00" * 2400)
         assert frame is not None and frame.sample_rate == 24000 and frame.num_channels == 1
         await s.deserialize(json.dumps({"type": "realtime.input.mute"}))
-        s.muted = True
-        assert await s.deserialize(b"\x01\x00" * 2400) is None           # muted: no audio reaches the model
         await s.deserialize(json.dumps({"type": "session.update", "session": {"instructions": "x"}}))
         await s.deserialize("not json")
         assert [e.get("type") for e in seen] == ["realtime.input.mute", "session.update", None]
+        gate = _gate_class()()
+        assert gate.passes(frame)
+        gate.muted = True
+        assert not gate.passes(frame)                                     # muted: no audio reaches the model
     asyncio.run(go())
 
 

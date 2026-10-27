@@ -19,10 +19,11 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from .call import CallRecord, run_call
+from . import webrtc
 from .device import DeviceLink
 from .config import HarnessConfig
 from .credentials import CredentialError, Credentials
@@ -84,8 +85,10 @@ class Call:
     status: str = "connecting"                    # connecting | live | paused | ended
     reason: str | None = None
     token_used: bool = False
+    transport: str = "websocket"
     resume_token: str = ""                        # the device's way back after a dropped connection (R-11)
-    link: DeviceLink | None = None
+    device: DeviceLink | webrtc.WebRTCDevice | None = None
+    task: asyncio.Task | None = None
     events: list[dict] = field(default_factory=list)
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     ended: asyncio.Event = field(default_factory=asyncio.Event)       # asks a live call to end
@@ -216,7 +219,7 @@ class Server:
                                  "memories": False,
                                  # the Realtime chapter, proposed for the next version (design §6.2): additive
                                  "realtime": True},
-                "realtime_transports": ["websocket"],
+                "realtime_transports": ["websocket"] + (["webrtc"] if webrtc.available() else []),
                 "implementation": {"name": "realtime-harness", "version": __version__}}
 
     def harness(self, hid: str) -> HarnessConfig:
@@ -303,7 +306,7 @@ class Server:
                 result = await turn
         except CredentialError as e:
             result = TurnResult(status="failed", error={"code": "provider_unavailable", "message": str(e)})
-        except Exception as e:  # noqa: BLE001: a failed task is a 200 with status failed, never a crash
+        except Exception as e:  # noqa: BLE001  # a failed task is a 200 with status failed, never a crash
             result = TurnResult(status="failed", error={"code": "harness_error", "message": f"The turn failed ({type(e).__name__})."})
         finally:
             if conn is not None:
@@ -352,7 +355,8 @@ class Server:
         return call is not None and call.status in ("connecting", "live")
 
     # ── realtime calls (design §6.2) ─────────────────────────────────────────────────────────
-    def create_call(self, body: dict, ws_base: str) -> dict:
+    def create_call(self, body: dict, base: str) -> dict:
+        """`base` is the server's own URL as the client reached it (scheme and host)."""
         meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         prev = body.get("previous_response_id")
         session = self.continued(str(prev), meta) if prev else None
@@ -364,8 +368,9 @@ class Server:
             raise UhpError(422, "model_unavailable", f"This server does not run {model!r}.", param="model",
                            detail={"available": list(self.models)})
         transport = str(body.get("transport") or "websocket")
-        if transport != "websocket":
-            raise UhpError(400, "invalid_input", "This server connects calls over websocket.", param="transport")
+        transports = ["websocket"] + (["webrtc"] if webrtc.available() else [])
+        if transport not in transports:
+            raise UhpError(400, "invalid_input", f"This server connects calls over {' or '.join(transports)}.", param="transport")
         if self.credentials is None:
             raise UhpError(503, "server_unavailable", "This server has no model connection configured.", etype="server_error")
         if session is None:
@@ -374,13 +379,16 @@ class Server:
         else:
             session.kind = "realtime"
         token = secrets.token_urlsafe(32)
-        call = Call(session=session, model=model, token=token, token_expires=time.time() + CONNECT_TOKEN_TTL_S)
+        call = Call(session=session, model=model, token=token, token_expires=time.time() + CONNECT_TOKEN_TTL_S,
+                    transport=transport)
         call.record = CallRecord(session.id, harness_id(h), model, call.publish)
         self.calls[session.id] = call
         self.tokens[token] = session.id
         ignored = sorted(k for k in body if k not in {"model", "metadata", "transport", "voice", "previous_response_id"})
+        if transport == "websocket":
+            base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         return {**self.session_dict(session), "connect": {
-            "transport": "websocket", "url": f"{ws_base}/v1/realtime/connect", "token": token,
+            "transport": transport, "url": f"{base}/v1/realtime/connect", "token": token,
             "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(call.token_expires))},
             **({"metadata": {"ignored_fields": ignored}} if ignored else {})}
 
@@ -392,7 +400,7 @@ class Server:
         call = self.calls.get(sid or "")
         if call is not None and token == call.resume_token:
             call.resume_token = ""
-            if call.status in ("live", "paused") and call.link is not None and not call.link.end_reason:
+            if call.status in ("live", "paused") and call.device is not None and not call.device.end_reason:
                 return call
             raise UhpError(401, "invalid_credential", "The connect token is not valid.", etype="authentication_error")
         if call is None or call.token_used or time.time() > call.token_expires:
@@ -407,14 +415,7 @@ class Server:
         self.tokens[call.resume_token] = call.session.id
         return call.resume_token
 
-    async def serve_call(self, websocket, call: Call) -> None:
-        # the way back in goes to the device only: it is the device's connection that may drop
-        await websocket.send_text(json.dumps({"type": "realtime.session.resume_token", "token": self._issue_resume_token(call)}))
-        if call.link is not None:
-            # the device is back: the call never stopped, and this connection carries it from here
-            await call.link.attach(websocket).wait()
-            return
-
+    def _pause_hooks(self, call: Call):
         def lost() -> None:
             call.status = "paused"
             call.record.event({"type": "realtime.session.paused", "resume_within_seconds": RESUME_GRACE_S})
@@ -422,13 +423,39 @@ class Server:
         def back() -> None:
             call.status = "live"
             call.record.event({"type": "realtime.session.resumed"})
+        return lost, back
 
-        call.link = DeviceLink(websocket, RESUME_GRACE_S, on_lost=lost, on_back=back)
-        call.status = "live"
-        await run_call(call.link, harness=call.session.harness, credentials=self.credentials, model=call.model,
+    async def _run_call(self, call: Call) -> None:
+        await run_call(call.device, harness=call.session.harness, credentials=self.credentials, model=call.model,
                        record=call.record, ended=call.ended, end_reason=call.end_reason, history=list(call.session.items))
-        await call.link.close()
+        await call.device.close()
         self._close_call(call, call.end_reason[0] if call.end_reason else "hangup")
+
+    async def serve_call(self, websocket, call: Call) -> None:
+        """A device on the WebSocket protocol. The route that accepted it returns when the call no longer
+        needs this connection."""
+        # the way back in goes to the device only: it is the device's connection that may drop
+        await websocket.send_text(json.dumps({"type": "realtime.session.resume_token", "token": self._issue_resume_token(call)}))
+        if call.device is not None:
+            # the device is back: the call never stopped, and this connection carries it from here
+            await call.device.attach(websocket).wait()
+            return
+        lost, back = self._pause_hooks(call)
+        call.device = DeviceLink(websocket, RESUME_GRACE_S, on_lost=lost, on_back=back)
+        call.status = "live"
+        await self._run_call(call)
+
+    async def serve_webrtc(self, sdp: str, call: Call) -> str:
+        """A device on WebRTC: its offer in, the answer out. The call runs on after this returns."""
+        if call.device is not None:
+            answer = await call.device.resume(sdp)
+        else:
+            lost, back = self._pause_hooks(call)
+            call.device, answer = await webrtc.WebRTCDevice.answer(sdp, RESUME_GRACE_S, lost, back)
+            call.status = "live"
+            call.task = asyncio.get_running_loop().create_task(self._run_call(call))
+        call.device.send({"type": "realtime.session.resume_token", "token": self._issue_resume_token(call)})
+        return answer
 
     def _close_call(self, call: Call, reason: str) -> None:
         """The call is over: its turns join the session's history, and the stream ends with its one terminal event."""
@@ -612,7 +639,7 @@ def create_app(server: Server) -> FastAPI:
             if not public:
                 auth(request)
             out = await handler()
-            if isinstance(out, (JSONResponse, StreamingResponse)):
+            if isinstance(out, Response):
                 out.headers["UHP-Version"] = version
                 return out
             return answer(out, 200, version)
@@ -685,7 +712,7 @@ def create_app(server: Server) -> FastAPI:
     async def create_call(request: Request):
         async def h():
             body = await json_body(request)
-            scheme = "wss" if (request.headers.get("x-forwarded-proto") or request.url.scheme) in ("https", "wss") else "ws"
+            scheme = "https" if (request.headers.get("x-forwarded-proto") or request.url.scheme) in ("https", "wss") else "http"
             host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
             return JSONResponse(server.create_call(body, f"{scheme}://{host}"), status_code=201)
         return await guarded(request, h)
@@ -698,8 +725,28 @@ def create_app(server: Server) -> FastAPI:
         except UhpError:
             await websocket.close(code=4401)
             return
+        if call.transport != "websocket":
+            await websocket.close(code=4400)
+            return
         await websocket.accept()
         await server.serve_call(websocket, call)
+
+    @app.post("/v1/realtime/connect")
+    async def connect_webrtc(request: Request):
+        """WHIP: the device's SDP offer in (application/sdp), the answer out, 201."""
+        async def h():
+            scheme, _, bearer = (request.headers.get("authorization") or "").partition(" ")
+            token = request.query_params.get("token") or (bearer.strip() if scheme.lower() == "bearer" else "")
+            call = server.claim(token)
+            if call.transport != "webrtc":
+                raise UhpError(400, "invalid_input", "This call connects over websocket.", param="transport")
+            sdp = (await request.body()).decode("utf-8", "replace")
+            if "v=0" not in sdp:
+                raise UhpError(400, "invalid_input", "The body is not an SDP offer.")
+            answer = await server.serve_webrtc(sdp, call)
+            return Response(answer, status_code=201, media_type="application/sdp",
+                            headers={"Location": f"/v1/sessions/{call.session.id}"})
+        return await guarded(request, h, public=True)          # the connect token is the credential here
 
     @app.get("/v1/sessions/{sid}")
     async def get_session(request: Request, sid: str):

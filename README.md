@@ -37,14 +37,14 @@ This is the first slice, not a release.
 | | |
 |---|---|
 | Provider | Azure OpenAI (`gpt-realtime-2.1`), on the OpenAI realtime wire. OpenAI direct uses the same path and has not been measured yet. Gemini Live, Nova Sonic and Grok Voice follow, each when it is measured (design §10). |
-| Transport | WebSocket (PCM16 audio and JSON events). WebRTC is next. |
+| Transport | WebSocket (PCM16 audio and JSON events), and WebRTC (Opus audio, events on a data channel) with the `webrtc` extra. |
 | UHP | **Core, 40/40** on text turns ([report](docs/reports/uhp-conformance-core-2026-10-27.json)). The Realtime chapter is implemented as proposed in design §6 and is not yet part of a published UHP version. |
 | Tools | MCP servers over Streamable HTTP or SSE. |
 
 ## Quickstart
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -e ".[test]"
+python3.12 -m venv .venv && .venv/bin/pip install -e ".[test,webrtc]"     # leave out webrtc for WebSocket only
 ```
 
 A harness file says what every call runs with:
@@ -105,7 +105,8 @@ A call adds four endpoints (design §6.2):
 | | |
 |---|---|
 | `POST /v1/realtime/sessions` | Makes a call. Returns the session and `connect: {transport, url, token, expires_at}`. The token connects once, within a minute. With `previous_response_id`, the call continues that session and starts from what was said in it. |
-| `WS /v1/realtime/connect?token=…` | The device's connection. Binary messages are PCM16 mono audio at 24 kHz, both ways. Text messages are JSON events; the first is `realtime.session.resume_token`. |
+| `WS /v1/realtime/connect?token=…` | A WebSocket call's device. Binary messages are PCM16 mono audio at 24 kHz, both ways. Text messages are JSON events; the first is `realtime.session.resume_token`. |
+| `POST /v1/realtime/connect?token=…` | A WebRTC call's device (`"transport": "webrtc"` when the call is made), the WHIP pattern: the SDP offer in (`application/sdp`), the answer out (201). Audio is Opus; the device opens a data channel named `uhp`, which carries the same events, both ways. |
 | `GET /v1/sessions/{id}/events` | The call's events (SSE), with one `sequence_number` from 0 across the whole call, ending with `realtime.session.ended`. |
 | `POST /v1/sessions/{id}/cancel` | Hangs up. The session and its turns stay readable (`GET /v1/sessions/{id}`, `GET /v1/responses/{id}`). |
 
@@ -119,11 +120,15 @@ the audio it has not played.
 From the device, four events are honoured: `realtime.input.mute`, `realtime.input.unmute`,
 `realtime.response.cancel` and `realtime.session.end`. Any other event is ignored and counted in the record.
 
-**A dropped device comes back to the same call.** Closing the socket with code 1000 hangs up. Any other drop
-pauses the call for 20 seconds: the provider connection is held, so the conversation is intact. The device
-reconnects at the same URL with its resume token in place of the connect token, and gets a new one. What the
-model said meanwhile is in the record, between `realtime.session.paused` and `realtime.session.resumed`. A
-device that does not come back ends the call with reason `device_lost`.
+**A dropped device comes back to the same call.** Over WebSocket, closing the socket with code 1000 hangs up,
+and any other drop pauses the call. Over WebRTC, a hang-up is `realtime.session.end` (or the client's cancel),
+and a closed peer connection pauses the call. A paused call waits 20 seconds with the provider connection
+held, so the conversation is intact. The device comes back at the same URL with its resume token in place of
+the connect token (over WebRTC, with a new offer), and gets a new token. What the model said meanwhile is in
+the record, between `realtime.session.paused` and `realtime.session.resumed`. A device that does not come
+back ends the call with reason `device_lost`.
+
+Behind a NAT, give the server STUN servers for WebRTC in `RTH_ICE_SERVERS` (comma separated).
 
 **A call and the text around it are one session.** A text turn can continue from a call's turn, and a call
 can start from any turn, with what each side said as the model's context.
@@ -150,8 +155,9 @@ The unit tests need no provider key: the tool executor runs against a real MCP s
 ([tests/fixture_mcp.py](tests/fixture_mcp.py)), and the call's record is tested on the events a call produces.
 
 [tests/live/call_checks.py](tests/live/call_checks.py) checks a running server with a provider, one short call
-each: a device that drops and comes back, a call that continues a text turn, and a caller who speaks while a
-slow tool runs. The questions are recorded speech in [tests/fixtures](tests/fixtures).
+each: a device that drops and comes back (over WebSocket and over WebRTC), a call that continues a text turn,
+a caller who speaks while a slow tool runs, and a call over WebRTC. The questions are recorded speech in
+[tests/fixtures](tests/fixtures).
 
 ## Built on
 

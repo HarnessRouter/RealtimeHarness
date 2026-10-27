@@ -5,10 +5,13 @@
     continue   a call that continues a text turn starts from what was said in it, and does not speak first
     slow-tool  the caller speaks while a slow tool runs: the tool is not cancelled, and its result is
                recorded where the model takes it (design §5.4)
+    webrtc     a call over WebRTC (Opus audio, events on a data channel): the question, the tool, the answer
+    webrtc-resume   resume, over WebRTC: the peer connection closes, and the device comes back with a new offer
 
-    RTH_URL=http://127.0.0.1:8790 RTH_KEY=<key> python tests/live/call_checks.py [resume|continue|slow-tool ...]
+    RTH_URL=http://127.0.0.1:8790 RTH_KEY=<key> python tests/live/call_checks.py [name ...]
 """
 import asyncio
+import fractions
 import json
 import os
 import sys
@@ -75,6 +78,8 @@ class Call:
 
 
 class Device:
+    transport = "websocket"
+
     def __init__(self):
         self.messages: list[dict] = []
         self.audio = 0
@@ -119,6 +124,89 @@ class Device:
         await self.ws.close(code=1000)
 
 
+class RtcDevice:
+    """A device on WebRTC (aiortc): the fixture's PCM as an Opus track, events on a data channel named uhp."""
+    transport = "webrtc"
+
+    def __init__(self):
+        self.messages: list[dict] = []
+        self.audio = 0
+
+    async def connect(self, url: str, token: str) -> "RtcDevice":
+        from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
+        from av import AudioFrame
+
+        class PcmTrack(MediaStreamTrack):
+            kind = "audio"
+
+            def __init__(self):
+                super().__init__()
+                self.pending, self.pts, self.t0 = bytearray(), 0, None
+
+            async def recv(self):
+                n = 480                                    # 20 ms at 24 kHz, paced like a microphone
+                self.t0 = self.t0 or time.time()
+                wait = self.t0 + self.pts / 24000 - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                chunk = bytes(self.pending[:n * 2])
+                del self.pending[:n * 2]
+                chunk += b"\x00" * (n * 2 - len(chunk))
+                f = AudioFrame(format="s16", layout="mono", samples=n)
+                f.planes[0].update(chunk)
+                f.sample_rate, f.pts, f.time_base = 24000, self.pts, fractions.Fraction(1, 24000)
+                self.pts += n
+                return f
+
+        self.mic = PcmTrack()
+        self.pc = RTCPeerConnection()
+        self.dc = self.pc.createDataChannel("uhp")
+
+        @self.dc.on("message")
+        def _m(m):
+            if isinstance(m, str) and m.startswith("{"):
+                self.messages.append(json.loads(m))
+
+        @self.pc.on("track")
+        def _t(track):
+            async def drain():
+                while True:
+                    try:
+                        f = await track.recv()
+                    except Exception:  # noqa: BLE001  # the track ended
+                        return
+                    self.audio += f.samples * 2 * 24000 // f.sample_rate
+            asyncio.ensure_future(drain())
+
+        self.pc.addTrack(self.mic)
+        await self.pc.setLocalDescription(await self.pc.createOffer())
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{url}?token={token}", content=self.pc.localDescription.sdp,
+                             headers={"Content-Type": "application/sdp"})
+        r.raise_for_status()
+        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=r.text, type="answer"))
+        return self
+
+    def resume_token(self) -> str | None:
+        return next((m["token"] for m in self.messages if m.get("type") == "realtime.session.resume_token"), None)
+
+    async def speak(self, name: str) -> None:
+        pcm = open(os.path.join(FIX, name), "rb").read()
+        self.mic.pending += pcm
+        await asyncio.sleep(len(pcm) / 48000 + 1.2)
+
+    async def keep_quiet(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    def drop(self) -> None:
+        asyncio.ensure_future(self.pc.close())        # the peer connection goes
+
+    async def hang_up(self) -> None:
+        self.dc.send(json.dumps({"type": "realtime.session.end"}))
+        await asyncio.sleep(0.5)
+        await self.pc.close()
+
+
 def said(turn: dict) -> tuple[str, str]:
     heard = " ".join(p.get("text", "") for i in turn["input"] for p in i.get("content", []))
     ans = [(i.get("content") or [{}])[0].get("text", "") for i in turn["output"] if i["type"] == "message"]
@@ -137,9 +225,10 @@ def report(name: str, call: Call, rec: dict, checks: dict) -> bool:
     return all(checks.values())
 
 
-async def resume() -> bool:
-    call = await Call().start()
-    a = await Device().connect(call.url, call.token)
+async def resume(device=None) -> bool:
+    device = device or Device
+    call = await Call({"transport": device.transport}).start()
+    a = await device().connect(call.url, call.token)
     await call.until(lambda e: e["type"] == "realtime.session.live")
     await a.speak("weather_question.pcm")
     first = await call.answers(1)
@@ -147,7 +236,7 @@ async def resume() -> bool:
     a.drop()
     paused = await call.until(lambda e: e["type"] == "realtime.session.paused", 15)
     await asyncio.sleep(3)
-    b = await Device().connect(call.url, token)
+    b = await device().connect(call.url, token)
     resumed = await call.until(lambda e: e["type"] == "realtime.session.resumed", 10)
     await b.keep_quiet(1)
     await b.speak("which_city.pcm")
@@ -155,8 +244,8 @@ async def resume() -> bool:
     await b.keep_quiet(1)
     await b.hang_up()
     rec = await call.record()
-    last = said(rec["responses"][-1])[1] if rec["responses"] else ""
-    return report("resume", call, rec, {
+    last = said(rec["responses"][1])[1] if len(rec["responses"]) > 1 else ""
+    return report(f"resume ({device.transport})", call, rec, {
         "first answer": first, "paused": paused, "resumed": resumed, "second answer": second,
         "new token on return": bool(b.resume_token()) and b.resume_token() != token,
         "one live event": call.count(lambda e: e["type"] == "realtime.session.live") == 1,
@@ -213,8 +302,28 @@ async def slow_tool() -> bool:
         "weather answered meanwhile": weather})
 
 
+async def webrtc_call() -> bool:
+    call = await Call({"transport": "webrtc"}).start()
+    a = await RtcDevice().connect(call.url, call.token)
+    live = await call.until(lambda e: e["type"] == "realtime.session.live")
+    await a.keep_quiet(1)
+    await a.speak("weather_question.pcm")
+    answered = await call.answers(1)
+    await a.keep_quiet(1)
+    await a.hang_up()
+    rec = await call.record()
+    t = rec["responses"][0] if rec["responses"] else {"output": [], "input": []}
+    return report("webrtc", call, rec, {
+        "live": live, "answered": answered, "resume token on the data channel": bool(a.resume_token()),
+        "events on the data channel": any(m.get("type") == "response.completed" for m in a.messages),
+        "model audio received": a.audio > 48000, "weather called": any(i.get("name") == "weather" for i in t["output"]),
+        "says 18": "18" in said(t)[1],
+        "ended hangup": bool(call.events) and call.events[-1].get("reason") == "hangup"})
+
+
 async def main(names: list[str]) -> int:
-    checks = {"resume": resume, "continue": continue_, "slow-tool": slow_tool}
+    checks = {"resume": resume, "continue": continue_, "slow-tool": slow_tool, "webrtc": webrtc_call,
+              "webrtc-resume": lambda: resume(RtcDevice)}
     ok = True
     for n in names or list(checks):
         ok = await checks[n]() and ok

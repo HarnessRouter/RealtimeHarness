@@ -1,8 +1,9 @@
 """One realtime call: the device's audio, the provider's model, the harness's tools, and the record (design §4).
 
-The pipeline is Pipecat's: its FastAPI WebSocket transport carries the device's audio (over a `DeviceLink`,
-so a dropped device can come back to the same call), its realtime service speaks the provider's wire, and its
-context aggregators send the follow-up response after a tool result.
+The pipeline is Pipecat's: its transport carries the device's audio (WebSocket, through a `DeviceLink`, or
+WebRTC, through a `WebRTCDevice`; either way a dropped device can come back to the same call), its realtime
+service speaks the provider's wire, and its context aggregators send the follow-up response after a tool
+result.
 What this module adds is what a harness owns (design §2):
 
 - The configuration is the harness's. Instructions, voice and tools are set when the provider connection
@@ -17,10 +18,11 @@ What this module adds is what a harness owns (design §2):
 - A call that continues a session starts with what each side said before, as conversation items on the
   provider (measured on Azure gpt-realtime-2.1: the model answers in audio, from that context).
 
-The device protocol (design §6.2): one WebSocket. Binary messages are PCM16 mono audio at 24 kHz, both
-ways. Text messages are JSON events: from the device, `realtime.input.mute`, `realtime.input.unmute`,
-`realtime.response.cancel`, `realtime.session.end`; to the device, the session's events, the same ones
-`GET /v1/sessions/{id}/events` streams.
+The device protocol (design §6.2): over WebSocket, binary messages are PCM16 mono audio at 24 kHz, both
+ways, and text messages are JSON events; over WebRTC, the audio is Opus and the events go on a data channel.
+From the device: `realtime.input.mute`, `realtime.input.unmute`, `realtime.response.cancel`,
+`realtime.session.end`. To the device: the session's events, the same ones `GET /v1/sessions/{id}/events`
+streams.
 """
 from __future__ import annotations
 
@@ -32,9 +34,9 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .credentials import Connection, Credentials
+from .device import SAMPLE_RATE
 from .tools import ToolExecutor
 
-SAMPLE_RATE = 24000
 # The provider says a response is done before Pipecat has started the tool calls it made, so the end of a
 # turn waits this long for a call that belongs to it (one turn: the model's words, its calls, and its
 # answer to their results).
@@ -221,58 +223,6 @@ class CallRecord:
         self.event({"type": terminal, "response": self.response_dict(t)})
 
 
-class DeviceSerializer:
-    """The device protocol over Pipecat's FastAPI WebSocket transport: PCM16 audio as binary, events as JSON."""
-
-    def __init__(self, on_device_event: Callable[[dict], None]):
-        from pipecat.serializers.base_serializer import FrameSerializer  # noqa: F401 (the interface implemented)
-        self.on_device_event = on_device_event
-        self.muted = False
-
-    async def setup(self, setup) -> None:
-        return None
-
-    def should_ignore_frame(self, frame) -> bool:
-        return False
-
-    async def serialize(self, frame):
-        from pipecat.frames.frames import (AudioRawFrame, InterruptionFrame, OutputTransportMessageFrame,
-                                           OutputTransportMessageUrgentFrame)
-        if isinstance(frame, AudioRawFrame):
-            return frame.audio
-        if isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
-            return json.dumps(frame.message, ensure_ascii=False)
-        if isinstance(frame, InterruptionFrame):
-            # the model was cut off: the device drops the audio it has queued and not yet played
-            return json.dumps({"type": "realtime.output_audio.cleared"})
-        return None
-
-    async def deserialize(self, data):
-        from pipecat.frames.frames import InputAudioRawFrame
-        if isinstance(data, (bytes, bytearray)):
-            if self.muted or not data:
-                return None
-            return InputAudioRawFrame(audio=bytes(data), sample_rate=SAMPLE_RATE, num_channels=1)
-        try:
-            ev = json.loads(data)
-        except (ValueError, TypeError):
-            ev = {}
-        self.on_device_event(ev if isinstance(ev, dict) else {})
-        return None
-
-
-def _serializer_class():
-    """DeviceSerializer as a Pipecat FrameSerializer subclass (built lazily, so importing this module does not
-    import Pipecat)."""
-    from pipecat.serializers.base_serializer import FrameSerializer
-
-    class _DeviceFrameSerializer(DeviceSerializer, FrameSerializer):
-        def __init__(self, on_device_event):
-            FrameSerializer.__init__(self)
-            DeviceSerializer.__init__(self, on_device_event)
-    return _DeviceFrameSerializer
-
-
 def _seeded(cls, earlier: list[dict]):
     """The provider's realtime service, starting from the session's earlier messages: each is a conversation
     item, sent once the provider session is configured and before anything is said. Pipecat's own way packs a
@@ -396,10 +346,32 @@ def context_messages(history: list[dict]) -> list[dict]:
     return out
 
 
-async def run_call(link, *, harness, credentials: Credentials, model: str, record: CallRecord,
+def _gate_class():
+    from pipecat.frames.frames import InputAudioRawFrame
+    from pipecat.processors.frame_processor import FrameProcessor
+
+    class MicGate(FrameProcessor):
+        """The device's mute, on every transport: while muted, none of the caller's audio reaches the model."""
+
+        def __init__(self):
+            super().__init__()
+            self.muted = False
+
+        def passes(self, frame) -> bool:
+            return not (self.muted and isinstance(frame, InputAudioRawFrame))
+
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if self.passes(frame):
+                await self.push_frame(frame, direction)
+    return MicGate
+
+
+async def run_call(device, *, harness, credentials: Credentials, model: str, record: CallRecord,
                    ended: asyncio.Event, end_reason: list[str], history: list[dict] | None = None) -> None:
-    """Serve one call on the device's link until the device hangs up or does not come back, the client
-    cancels, the budget ends it, or the provider closes. `end_reason[0]` says which."""
+    """Serve one call on the device (a WebSocket `DeviceLink` or a `WebRTCDevice`) until the device hangs up or
+    does not come back, the client cancels, the budget ends it, or the provider closes. `end_reason[0]` says
+    which."""
     from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
     from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
     from pipecat.frames.frames import InterruptionFrame, OutputTransportMessageUrgentFrame
@@ -409,7 +381,6 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
     from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
     from pipecat.services.openai.realtime import events as ev
     from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMSettings
-    from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
     from pipecat.workers.runner import WorkerRunner
 
     executor = ToolExecutor(harness)
@@ -423,7 +394,7 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
         if worker is not None:
             loop.create_task(worker.cancel(reason=reason))
 
-    serializer = None
+    gate = _gate_class()()
 
     def on_device_event(e: dict) -> None:
         t = str(e.get("type") or "")
@@ -431,9 +402,9 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
             record.ignored_device_events += 1           # a device narrows a call and never widens it
             return
         if t == "realtime.input.mute":
-            serializer.muted = True
+            gate.muted = True
         elif t == "realtime.input.unmute":
-            serializer.muted = False
+            gate.muted = False
         elif t == "realtime.response.cancel" and worker is not None:
             loop.create_task(worker.queue_frame(InterruptionFrame()))
         elif t == "realtime.session.end":
@@ -464,13 +435,10 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
         # call is open, and takes the late result afterwards; the result is always recorded
         llm.register_function(None, run_tool, cancel_on_interruption=False)
 
-        serializer = _serializer_class()(on_device_event)
-        transport = FastAPIWebsocketTransport(link, FastAPIWebsocketParams(
-            audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=SAMPLE_RATE,
-            audio_out_sample_rate=SAMPLE_RATE, add_wav_header=False, serializer=serializer))
+        transport = device.transport(on_device_event, finish)
         context = LLMContext([], tools) if tools else LLMContext([])         # the earlier messages are seeded above
         user_agg, assistant_agg = LLMContextAggregatorPair(context)
-        pipeline = Pipeline([transport.input(), user_agg, llm, transport.output(), assistant_agg])
+        pipeline = Pipeline([transport.input(), gate, user_agg, llm, transport.output(), assistant_agg])
         recorder = _recorder_class()(record, interrupted=lambda: record.end_turn("cancelled") if record.current else None)
         worker = PipelineWorker(pipeline, params=PipelineParams(audio_in_sample_rate=SAMPLE_RATE, audio_out_sample_rate=SAMPLE_RATE,
                                                                 enable_metrics=True, enable_usage_metrics=True),
@@ -486,10 +454,6 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
             publish_to_device(e)
         record._publish = both
 
-        @transport.event_handler("on_client_disconnected")
-        async def _gone(_t, _c):
-            finish(link.end_reason or "hangup")    # a drop pauses inside the link; this is the device gone for good
-
         budget = loop.call_later(harness.max_call_minutes * 60, finish, "budget")
         stop_watch = loop.create_task(_wait_and(ended, lambda: finish(end_reason[0] if end_reason else "hangup")))
         record.event({"type": "realtime.session.live", "session_id": record.session_id, "model": record.model,
@@ -503,7 +467,7 @@ async def run_call(link, *, harness, credentials: Credentials, model: str, recor
             stop_watch.cancel()
         if not end_reason:
             end_reason.append("provider_closed")
-    except Exception as e:  # noqa: BLE001: the call ends, and the record says why
+    except Exception as e:  # noqa: BLE001  # the call ends, and the record says why
         if not end_reason:
             end_reason.append("error")
         record.event({"type": "error", "error": {"type": "harness_error", "code": "call_failed",

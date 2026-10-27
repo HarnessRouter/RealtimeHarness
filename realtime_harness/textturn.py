@@ -82,7 +82,7 @@ async def run_text_turn(conn: Connection, *, instructions: str, executor: ToolEx
     result = TurnResult()
     try:
         ws = await websockets.connect(conn.url, additional_headers=conn.headers, max_size=None, open_timeout=OPEN_TIMEOUT_S)
-    except Exception as e:  # noqa: BLE001: the provider could not be reached; the message names no secret
+    except Exception as e:  # noqa: BLE001  # the provider could not be reached; the message names no secret
         return TurnResult(status="failed", error={"code": "provider_unavailable",
                                                   "message": f"The model could not be reached ({type(e).__name__})."})
     try:

@@ -423,8 +423,11 @@ few event types. It reuses everything else:
 3. **Connecting.** WebRTC: the device POSTs its SDP offer to `connect.url` with the token, and gets
    the answer back (the WHIP pattern). Audio is Opus, and a data channel named `uhp` carries events.
    WebSocket: one socket at `connect.url`, PCM16 frames, with JSON events in the same vocabulary.
-   The first event the device gets is `realtime.session.resume_token`. A device that closes the socket
-   with code 1000 hangs up; any other drop pauses the call (§9, item 2).
+   The first event the device gets is `realtime.session.resume_token`, on the socket or the data
+   channel. Over WebSocket, a device that closes the socket with code 1000 hangs up, and any other drop
+   pauses the call (§9, item 2). Over WebRTC, a hang-up is `realtime.session.end`, and a closed peer
+   connection pauses the call; the device comes back by POSTing a new offer with its resume token,
+   which restarts the peer connection into the same call.
 4. **The session's event stream.** `GET /v1/sessions/{id}/events` (SSE, one `sequence_number`
    across the whole call), and the same events on the data channel. Per turn: the existing
    vocabulary. Per call, new and optional: `realtime.session.live`, `realtime.input_transcript.delta`
