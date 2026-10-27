@@ -47,6 +47,8 @@ ANSWER_WAIT_S = 20.0
 # A provider connection that drops mid-call is replaced this many times per call (design §9 item 2), each new
 # one seeded with what was said so far; after that the call ends with reason `provider_closed`.
 MAX_PROVIDER_RECONNECTS = 2
+# Design §5.2: the provider waits on a tool in silence, so the caller hears why before the wait starts.
+SAY_BEFORE_A_TOOL = "Before you use a tool, tell the caller in a few words what you are about to check."
 DEVICE_EVENTS = {"realtime.input.mute", "realtime.input.unmute", "realtime.response.cancel", "realtime.session.end"}
 
 
@@ -154,8 +156,11 @@ class CallRecord:
                 "arguments": args}
         t.calls[call_id] = item
         t.output.append(item)
-        self.event({"type": "response.output_item.added", "response_id": t.id, "output_index": len(t.output) - 1, "item": item})
-        self.event({"type": "response.output_item.done", "response_id": t.id, "output_index": len(t.output) - 1, "item": item})
+        idx = len(t.output) - 1
+        self.event({"type": "response.output_item.added", "response_id": t.id, "output_index": idx, "item": item})
+        self.event({"type": "response.function_call_arguments.done", "response_id": t.id, "output_index": idx,
+                    "item_id": item["id"], "arguments": args})
+        self.event({"type": "response.output_item.done", "response_id": t.id, "output_index": idx, "item": item})
 
     def call_finished(self, call_id: str, result) -> None:
         t = next((x for x in reversed(self.turns) if call_id in x.calls), None)
@@ -197,9 +202,11 @@ class CallRecord:
             self._ending = None
 
     def response_ended(self) -> None:
-        """The provider finished one response: the turn ends unless a call of this turn follows."""
+        """The provider finished one response: what it said is one message item, and the turn ends unless a call
+        of this turn follows."""
         if self.current is None:
             return
+        self._close_message(self.current)
         self._cancel_ending()
         self._ending = asyncio.get_running_loop().call_later(TURN_END_GRACE_S, self._end_if_settled)
 
@@ -372,6 +379,12 @@ def context_messages(history: list[dict]) -> list[dict]:
     return out
 
 
+def call_instructions(owner: str, has_tools: bool) -> str | None:
+    """The owner's instructions, and, when the call has tools, the one line design §5.2 adds."""
+    parts = [p for p in ((owner or "").strip(), SAY_BEFORE_A_TOOL if has_tools else "") if p]
+    return "\n\n".join(parts) or None
+
+
 def _gate_class():
     from pipecat.frames.frames import InputAudioRawFrame
     from pipecat.processors.frame_processor import FrameProcessor
@@ -448,10 +461,11 @@ async def run_call(device, *, harness, credentials: Credentials, model: str, rec
         tools = ToolsSchema(standard_tools=[FunctionSchema(
             name=f["name"], description=f["description"], properties=dict(f["parameters"].get("properties") or {}),
             required=list(f["parameters"].get("required") or [])) for f in functions]) if functions else None
+        instructions = call_instructions(harness.instructions, bool(functions))
         settings = OpenAIRealtimeLLMSettings(
-            system_instruction=harness.instructions or None,
+            system_instruction=instructions,
             session_properties=ev.SessionProperties(
-                instructions=(harness.instructions or None),
+                instructions=instructions,
                 audio=ev.AudioConfiguration(
                     input=ev.AudioInput(transcription=ev.InputAudioTranscription(model=harness.transcription_model))
                     if harness.transcription_model else None,

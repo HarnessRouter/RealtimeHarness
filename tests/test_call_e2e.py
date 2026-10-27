@@ -136,7 +136,8 @@ def test_a_call_records_the_question_the_tool_and_the_answer_and_the_device_cann
         assert types == ["function_call", "function_call_output", "message"]                             # R-05
         assert t["output"][0]["call_id"] == t["output"][1]["call_id"] and "18" in p.said(t)
         assert t["usage"]["output_tokens"] > 0 and t["usage"]["output_audio_tokens"] > 0                 # R-10
-        assert fake.sessions[0]["instructions"] == "Answer in English." and fake.sessions[0]["tools"]    # R-07
+        assert fake.sessions[0]["instructions"].startswith("Answer in English.") and fake.sessions[0]["tools"]  # R-07
+        assert "Answer in French." not in fake.sessions[0]["instructions"]
         seqs = [e["sequence_number"] for e in p.events]
         assert seqs == list(range(len(seqs))) and p.events[-1]["type"] == "realtime.session.ended"       # R-09
         assert p.events[-1]["reason"] == "hangup" and p.events[-1]["ignored_device_events"] == 1

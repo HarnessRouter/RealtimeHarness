@@ -22,6 +22,7 @@ meter. Realtime Harness does those four things, and serves the result over the
   send can add a tool or change the instructions.
 - **Every tool call runs here.** The model's function calls are run on the harness's MCP servers and answered,
   each within the harness's timeout. A disabled server is never contacted and a disabled tool is never run.
+  The caller waits on a tool in silence, so the model is told to say what it is checking before it calls one.
 - **Every call is a record.** Each model turn is a UHP response, written while the call happens: what the person
   said (transcribed), what the model said, each tool call and its result, and the provider's usage.
 - **The key stays on the server.** Standalone, the harness reads a provider key from its environment. Behind a

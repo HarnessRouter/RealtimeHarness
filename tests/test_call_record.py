@@ -42,6 +42,8 @@ def test_one_turn_holds_the_words_the_call_its_result_and_the_answer():
         assert types[0] == "response.created" and types[-1] == "response.completed"
         assert [e["sequence_number"] for e in events] == list(range(len(events)))
         assert types.count("realtime.output_transcript.done") == 2
+        fc = types.index("response.function_call_arguments.done")              # between the call's added and done
+        assert types[fc - 1] == "response.output_item.added" and types[fc + 1] == "response.output_item.done"
     asyncio.run(go())
 
 
@@ -155,4 +157,27 @@ def test_a_provider_drop_fails_a_turn_it_cut_off_and_keeps_one_it_had_answered()
         rec.provider_lost()
         assert [t.status for t in rec.turns] == ["completed", "failed"]
         assert rec.turns[1].output[0]["status"] == "incomplete"
+    asyncio.run(go())
+
+
+def test_a_call_with_tools_is_told_to_say_so_before_using_one():
+    from realtime_harness.call import SAY_BEFORE_A_TOOL, call_instructions
+    assert call_instructions("Be brief.", True) == "Be brief.\n\n" + SAY_BEFORE_A_TOOL
+    assert call_instructions("Be brief.", False) == "Be brief."
+    assert call_instructions("", True) == SAY_BEFORE_A_TOOL and call_instructions("", False) is None
+
+
+def test_each_provider_response_is_its_own_message():
+    async def go():
+        rec, _ = _record()
+        rec.model_said("Checking both.")
+        rec.call_started("c1", "weather", "{}")
+        rec.call_finished("c1", "clear")
+        rec.model_said("Paris is clear.")
+        rec.response_ended()
+        rec.model_said("Your order has shipped.")             # the provider's next response, same turn
+        rec.response_ended()
+        await asyncio.sleep(TURN_END_GRACE_S + 0.2)
+        texts = [i["content"][0]["text"] for i in rec.turns[0].output if i["type"] == "message"]
+        assert texts == ["Checking both.", "Paris is clear.", "Your order has shipped."]
     asyncio.run(go())
