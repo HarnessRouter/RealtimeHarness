@@ -18,10 +18,11 @@ import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
+from .call import CallRecord, run_call
 from .config import HarnessConfig
 from .credentials import CredentialError, Credentials
 from .textturn import Listener, TurnResult, run_text_turn
@@ -69,6 +70,33 @@ class Session:
     last_response_id: str | None = None
     kind: str = "text"                                   # text | realtime
     created_at: int = field(default_factory=lambda: int(time.time()))
+
+
+@dataclass
+class Call:
+    """A realtime session's call: the device's one-time connect token, the record and the event stream."""
+    session: Session
+    model: str
+    token: str
+    token_expires: float
+    record: CallRecord | None = None
+    status: str = "connecting"                    # connecting | live | ended
+    reason: str | None = None
+    token_used: bool = False
+    events: list[dict] = field(default_factory=list)
+    subscribers: list[asyncio.Queue] = field(default_factory=list)
+    ended: asyncio.Event = field(default_factory=asyncio.Event)       # asks a live call to end
+    closed: asyncio.Event = field(default_factory=asyncio.Event)      # the call is over
+    end_reason: list[str] = field(default_factory=list)
+
+    def publish(self, ev: dict) -> None:
+        ev = {**ev, "sequence_number": len(self.events)}     # one gapless sequence across the whole call
+        self.events.append(ev)
+        for q in list(self.subscribers):
+            q.put_nowait(ev)
+
+
+CONNECT_TOKEN_TTL_S = 60
 
 
 @dataclass
@@ -171,6 +199,8 @@ class Server:
         self.models = models or [DEFAULT_MODEL]
         self.tasks: dict[str, Task] = {}
         self.sessions: dict[str, Session] = {}
+        self.calls: dict[str, Call] = {}                     # by session id
+        self.tokens: dict[str, str] = {}                     # connect token -> session id
 
     # ── discovery ────────────────────────────────────────────────────────────────────────────
     def discovery(self) -> dict:
@@ -303,6 +333,105 @@ class Server:
         for q in list(task.subscribers):
             q.put_nowait(None)
 
+    # ── realtime calls (design §6.2) ─────────────────────────────────────────────────────────
+    def create_call(self, body: dict, ws_base: str) -> dict:
+        meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        h = self.harness(str(meta.get("harness_id") or self.default_harness))
+        model = str(body.get("model") or h.default_model or self.models[0])
+        if model not in self.models:
+            raise UhpError(422, "model_unavailable", f"This server does not run {model!r}.", param="model",
+                           detail={"available": list(self.models)})
+        transport = str(body.get("transport") or "websocket")
+        if transport != "websocket":
+            raise UhpError(400, "invalid_input", "This server connects calls over websocket.", param="transport")
+        if self.credentials is None:
+            raise UhpError(503, "server_unavailable", "This server has no model connection configured.", etype="server_error")
+        session = Session(id=_rid("hsess"), harness=h, kind="realtime")
+        self.sessions[session.id] = session
+        token = secrets.token_urlsafe(32)
+        call = Call(session=session, model=model, token=token, token_expires=time.time() + CONNECT_TOKEN_TTL_S)
+        call.record = CallRecord(session.id, harness_id(h), model, call.publish)
+        self.calls[session.id] = call
+        self.tokens[token] = session.id
+        ignored = sorted(k for k in body if k not in {"model", "metadata", "transport", "voice"})
+        return {**self.session_dict(session), "connect": {
+            "transport": "websocket", "url": f"{ws_base}/v1/realtime/connect", "token": token,
+            "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(call.token_expires))},
+            **({"metadata": {"ignored_fields": ignored}} if ignored else {})}
+
+    def claim(self, token: str) -> Call:
+        """A connect token is good for one connection, within its minute (design §6.2)."""
+        sid = self.tokens.pop(token, None)
+        call = self.calls.get(sid or "")
+        if call is None or call.token_used or time.time() > call.token_expires:
+            raise UhpError(401, "invalid_credential", "The connect token is not valid.", etype="authentication_error")
+        call.token_used = True
+        return call
+
+    async def serve_call(self, websocket, call: Call) -> None:
+        call.status = "live"
+        await run_call(websocket, harness=call.session.harness, credentials=self.credentials, model=call.model,
+                       record=call.record, ended=call.ended, end_reason=call.end_reason)
+        call.reason = call.end_reason[0] if call.end_reason else "hangup"
+        call.status = "ended"
+        call.record.event({"type": "realtime.session.ended", "reason": call.reason,
+                           "ignored_device_events": call.record.ignored_device_events})
+        call.closed.set()
+        for q in list(call.subscribers):
+            q.put_nowait(None)
+
+    def session_dict(self, s: Session) -> dict:
+        call = self.calls.get(s.id)
+        d = {"id": s.id, "object": "session", "created_at": s.created_at, "harness_id": harness_id(s.harness),
+             "kind": s.kind, "status": (call.status if call else ("running" if s.running else "idle")),
+             "last_response_id": s.last_response_id}
+        if call is not None:
+            d["model"] = call.model
+            d["responses"] = [call.record.response_dict(t) for t in call.record.turns]
+            if call.reason:
+                d["ended_reason"] = call.reason
+            d["last_response_id"] = call.record.turns[-1].id if call.record.turns else None
+        return d
+
+    def session(self, sid: str) -> Session:
+        s = self.sessions.get(sid)
+        if s is None:
+            raise UhpError(404, "session_not_found", "No session with that id.", param="session_id")
+        return s
+
+    async def call_events(self, call: Call) -> AsyncIterator[bytes]:
+        """The call's events from the first, with their call-wide sequence numbers, until it ends."""
+        q: asyncio.Queue = asyncio.Queue()
+        backlog = list(call.events)
+        call.subscribers.append(q)
+        try:
+            for ev in backlog:
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
+            if call.closed.is_set():
+                return
+            seen = len(backlog)
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), KEEPALIVE_S)
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+                if ev is None:
+                    return
+                if ev["sequence_number"] < seen:
+                    continue
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
+        finally:
+            if q in call.subscribers:
+                call.subscribers.remove(q)
+
+    def response_of_call(self, rid: str) -> dict | None:
+        for call in self.calls.values():
+            for t in call.record.turns:
+                if t.id == rid:
+                    return call.record.response_dict(t)
+        return None
+
     def get(self, rid: str) -> Task:
         t = self.tasks.get(rid)
         if t is None:
@@ -321,9 +450,23 @@ class Server:
         return t
 
     async def cancel_session(self, sid: str) -> dict:
-        s = self.sessions.get(sid)
-        if s is None:
-            raise UhpError(404, "session_not_found", "No session with that id.", param="session_id")
+        s = self.session(sid)
+        call = self.calls.get(sid)
+        if call is not None:                         # hangs up; the record stays readable
+            if call.status == "live":
+                if not call.end_reason:
+                    call.end_reason.append("hangup")
+                call.ended.set()
+                try:
+                    await asyncio.wait_for(call.closed.wait(), 30)
+                except asyncio.TimeoutError:
+                    pass
+            elif call.status == "connecting":
+                call.status, call.reason = "ended", "hangup"
+                self.tokens.pop(call.token, None)
+                call.record.event({"type": "realtime.session.ended", "reason": "hangup", "ignored_device_events": 0})
+                call.closed.set()
+            return self.session_dict(s)
         if s.running:
             await self.cancel(s.running)
         return {"id": s.id, "object": "session", "status": "idle"}
@@ -472,7 +615,45 @@ def create_app(server: Server) -> FastAPI:
     @app.get("/v1/responses/{rid}")
     async def get_response(request: Request, rid: str):
         async def h():
-            return server.get(rid).to_dict()
+            in_call = server.response_of_call(rid)
+            return in_call if in_call is not None else server.get(rid).to_dict()
+        return await guarded(request, h)
+
+    @app.post("/v1/realtime/sessions")
+    async def create_call(request: Request):
+        async def h():
+            body = await json_body(request)
+            scheme = "wss" if (request.headers.get("x-forwarded-proto") or request.url.scheme) in ("https", "wss") else "ws"
+            host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+            return JSONResponse(server.create_call(body, f"{scheme}://{host}"), status_code=201)
+        return await guarded(request, h)
+
+    @app.websocket("/v1/realtime/connect")
+    async def connect(websocket: WebSocket):
+        token = websocket.query_params.get("token") or ""
+        try:
+            call = server.claim(token)
+        except UhpError:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        await server.serve_call(websocket, call)
+
+    @app.get("/v1/sessions/{sid}")
+    async def get_session(request: Request, sid: str):
+        async def h():
+            return server.session_dict(server.session(sid))
+        return await guarded(request, h)
+
+    @app.get("/v1/sessions/{sid}/events")
+    async def session_events(request: Request, sid: str):
+        async def h():
+            server.session(sid)
+            call = server.calls.get(sid)
+            if call is None:
+                raise UhpError(404, "session_not_found", "That session is not a realtime call.", param="session_id")
+            return StreamingResponse(server.call_events(call), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
         return await guarded(request, h)
 
     @app.post("/v1/responses/{rid}/cancel")

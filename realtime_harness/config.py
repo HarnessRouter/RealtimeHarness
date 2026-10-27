@@ -85,6 +85,9 @@ class HarnessConfig:
     tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_S
     max_call_minutes: float = DEFAULT_MAX_CALL_MINUTES
     default_model: str = ""
+    # the provider's model (on Azure, the deployment) that transcribes the caller's speech for the record;
+    # empty leaves the provider session's own setting
+    transcription_model: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "HarnessConfig":
@@ -100,7 +103,8 @@ class HarnessConfig:
                    mcp_servers=[McpServer.from_dict(s) for s in d.get("mcp_servers") or []],
                    disabled_tools=[str(t) for t in d.get("disabled_tools") or []],
                    tool_timeout_seconds=timeout, max_call_minutes=minutes,
-                   default_model=str(d.get("default_model") or ""))
+                   default_model=str(d.get("default_model") or ""),
+                   transcription_model=str(d.get("transcription_model") or ""))
 
 
 def load(path: str) -> list[HarnessConfig]:

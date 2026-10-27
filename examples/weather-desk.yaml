@@ -6,3 +6,5 @@ tool_timeout_seconds: 10
 mcp_servers:
   - name: fixture
     url: http://127.0.0.1:18933/mcp
+# Azure takes the transcription model by its deployment name on the resource
+# transcription_model: gpt-4o-transcribe
