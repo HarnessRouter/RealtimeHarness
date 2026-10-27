@@ -54,7 +54,7 @@ exception, run by the provider, and they are out of scope here.
 | OpenAI Realtime | `session.update` `tools` | `response.function_call_arguments.done` / `output_item.done` (`call_id`) | `conversation.item.create` `function_call_output`, then `response.create` | The output can be sent later; the model can keep talking | `response.cancel`; documentation silent on pending calls. **To measure** |
 | GPT-Live, responses delegation | `delegation.responses.tools` | nested `response.event` → `response.output_item.done` | `response.item.create` + `response.create`; every pending call needs a result (`function_call_outputs_required`) | Not documented | **To measure** |
 | GPT-Live, client delegation | the application's own backend | `session.delegation.created` | `session.commentary.append` (spoken) or `session.thinking.append` (unspoken), 500 tokens each | Yes, by construction | **To measure** |
-| Azure OpenAI | as OpenAI Realtime | as OpenAI Realtime | as OpenAI Realtime | as OpenAI | **To measure** |
+| Azure OpenAI | as OpenAI Realtime | as OpenAI Realtime | as OpenAI Realtime | Yes: a result 8 s late was taken, and the model answered other speech meanwhile (§1.7) | The response is cancelled; a pending call is not, and its late result is taken (§1.7) |
 | xAI Grok Voice | `session.update` `tools` (per integrators) | `response.function_call_arguments.done` | `function_call_output` item + one `response.create` after all results | Not documented | **To measure** |
 | Gemini Live | `setup.tools[].function_declarations` | `toolCall.functionCalls[]` | `toolResponse.functionResponses[]` by `id` | `behavior: NON_BLOCKING`, `scheduling` `INTERRUPT` / `WHEN_IDLE` / `SILENT`. Google's table: 2.5 Flash Live sync and async, 3.1 Flash Live **sync only** ("the model will not start responding until you've sent the tool response") | `toolCallCancellation` |
 | Nova Sonic | `promptStart` tool configuration | `toolUse` (`toolUseId`) | TOOL content block with `toolResult` | Documentation silent. **To measure** | Documentation silent. **To measure** |
@@ -71,7 +71,7 @@ exactly this case, and they differ in what the credential can pin:
 | Provider | Short-lived credential | Can it lock the session's instructions and tools? |
 |---|---|---|
 | OpenAI | `POST /v1/realtime/client_secrets` (session config set at mint) | The mint sets the config. The documentation does not say a client is prevented from sending `session.update` later. **To measure** |
-| Azure OpenAI | `POST /openai/v1/realtime/client_secrets` on the resource (the GA endpoint; the preview `sessions` endpoint is deprecated) | As OpenAI. **To measure** |
+| Azure OpenAI | `POST /openai/v1/realtime/client_secrets` on the resource (the GA endpoint; the preview `sessions` endpoint is deprecated) | **No** (measured, §1.7). A client holding the secret replaced the tools and the instructions with `session.update`. |
 | xAI | `POST /v1/realtime/client_secrets` with `expires_after` only; the mint "does not support" a `session` field | **No.** Nothing can be pinned at mint. |
 | Gemini | `auth_tokens` (`expireTime` default 30 min, `newSessionExpireTime` default 1 min, `uses`), `liveConnectConstraints` and `lockAdditionalFields`; Gemini API `v1beta` only | Model and config can be locked. Whether the system instruction and tools are lockable is not stated. **To measure** |
 | AWS Bedrock | STS session credentials scoped to `InvokeModelWithBidirectionalStream` on one model | Nothing is pinned. The caller signs every request, and there is no browser path. |
@@ -100,8 +100,8 @@ The providers report usage per response, in tokens split by modality: OpenAI and
 are priced per minute rather than per token. The harness records what the provider reported and
 fabricates nothing (§8).
 
-Session length is capped by every provider, and the caps differ. **To measure**, per provider, and
-recorded in §10.
+Session length is capped by every provider, and the caps differ, per provider in §10. Azure OpenAI
+holds a session for 60 minutes: its `session.expires_at` is the session's start plus 3,600 s (§1.7).
 
 ### 1.6 The measurements this section waits for
 
@@ -122,6 +122,33 @@ endpoint, with a recorded audio fixture (§11) so a run is repeatable:
    same session.
 7. **Session caps:** the longest session each provider holds, and what it sends when the cap is
    reached.
+
+### 1.7 Measured on Azure OpenAI (2026-10-27)
+
+The first provider measured. The calls ran on `gpt-realtime-2.1` (a US data zone deployment), opened
+with a short-lived client secret minted by a gateway that holds the resource key, from a test server
+in the US. Each session was ended through the gateway's meter. Turns were sent as text input; the
+barge-in clip is the model's own speech of one sentence, captured from an earlier answer and sent
+back as the caller's audio (PCM16, 24 kHz, in 100 ms frames). The tools are two function tools the
+client runs itself. Small samples: these numbers place the design, they are not a benchmark.
+
+| What | Measured |
+|---|---|
+| Mint, then WebSocket open | 2.1 s to mint (the gateway's whole request), 0.7 s to open the socket. The client secret opens a **WebSocket** as a bearer token (`wss://<resource>/openai/v1/realtime?model=<deployment>`), not only WebRTC, so the relay (§1.4) can carry a per-session credential. |
+| Ask to call emitted | 1.2 to 1.4 s from the question to `response.function_call_arguments.done` (3 calls). |
+| Result to first audio | 330 to 470 ms from the `function_call_output` to the first audio delta; the answer finished 1.1 to 1.2 s after the result. |
+| Two calls at once | Asked for two cities, the model emitted both calls in one response and answered both in one sentence, 1.9 s after the results. |
+| A result 8 s late | Nothing happened while it waited: no event, no audio, no timeout. With the result, the model answered at once (0.8 s to the end of its answer). |
+| Barge-in while the model speaks | Speech detected 0.1 to 0.65 s into the caller's audio. The model's answer was cut off in 2 of 3 trials, about 0.2 s in (`response.done` with status `cancelled`); in the third the answer was not cancelled. The caller's speech was transcribed each time. |
+| The caller speaks while a call is pending | The server took the speech as a turn and the model answered it while the call was still open. The late `function_call_output` was then accepted without an error, and the next response completed. A pending call blocks nothing. |
+| Through a relay hop | First audio after an ask: 1.0 to 1.4 s direct, 0.8 to 1.2 s through a one-hop relay on the same server (3 each, medians 1.33 s and 1.07 s). The hop's own cost is below this noise; what a relay adds is the network path to it, which placement (§9) decides. |
+| Changing the call after the mint | `session.update` from the client replaced the tools (with none) and the instructions, and the server confirmed both (`session.updated`). A model change was confirmed and did not take effect: the session kept its model. So Azure, like OpenAI's mint, cannot lock a call against the person holding its secret; the relay topology (§1.4, §13 decision 1) is what keeps the configuration the owner's. |
+| The secret's lifetime | Minted for 120 s, the secret still opened a session at 135 s. The expiry bounds starting a call only loosely; it is not a revocation. |
+| Usage | `response.done.usage` per response: `input_tokens` and `output_tokens`, split into text, audio and image tokens, cached input (with its own split), and `reasoning_tokens` when the model reasoned. Checking these against Azure's own billing needs a voice-input session and is still to do. |
+| Session cap | 60 minutes (`session.expires_at` = start + 3,600 s). What the server sends at the cap is still to measure. |
+| Sideband | Not measurable from the client: attaching to a call takes the resource key. Azure's documentation still says nothing; this is measured from the upstream service (§7) when it exists. |
+
+Every other provider in §10 is measured the same way before its row is shipped.
 
 ## 2. First principles: what a harness for a realtime model is
 
@@ -304,8 +331,10 @@ where §1.6 item 5 shows the mint can lock the configuration.
 2. The recorder writes a `function_call` item to the current response, and streams
    `response.output_item.added`, then `response.function_call_arguments.done`.
 3. The tool executor runs the call on the MCP server that owns the tool, under the harness's
-   per-call timeout (`toolTimeoutSeconds`, default 15 s: on a voice call, a tool slower than that is
-   a dead line). Behind a server with an approval gate, the call goes through that gate exactly as
+   per-call timeout (`toolTimeoutSeconds`, default 10 s, §13 decision 7: the provider waits on a
+   call in complete silence, so the limit is how long the caller hears nothing). The harness adds
+   one line to the instructions, to say so before using a tool, so the wait starts after the
+   caller has heard why. Behind a server with an approval gate, the call goes through that gate exactly as
    a text turn's call does, and a held call answers at once (§5.3).
 4. The result goes back to the provider in its own shape (§1.2), and the recorder writes the
    `function_call_output` item with the same `call_id`.
@@ -317,7 +346,7 @@ that way; otherwise all results go back together, followed by one `response.crea
 
 The model always gets an answer to its call: a refusal, a timeout or a server error each come back
 as the call's result, a short JSON object such as
-`{"error": "timeout", "detail": "the tool did not answer within 15 seconds"}`. The model can then say
+`{"error": "timeout", "detail": "the tool did not answer within 10 seconds"}`. The model can then say
 so. A call left unanswered stalls Gemini 3.1 Flash Live and GPT-Live's responses delegation
 outright, and the others in practice. The recorded `function_call_output` carries the same object.
 
@@ -341,7 +370,8 @@ When the person speaks over the model while a call is running:
 - Where the provider cancels pending calls (Gemini's `toolCallCancellation`), the harness cancels
   the MCP request, and records the output as `{"error": "cancelled"}`.
 - Where it does not, the call finishes, and its result is returned if the provider still takes it.
-  It is always recorded.
+  It is always recorded. Azure OpenAI does not cancel: it answers the caller while the call is open,
+  and takes the late result afterwards without an error (§1.7).
 
 A tool expected to be slow can be marked `async` on the harness (§13, decision 3). The model is then
 told at once that the work has started, and the result is injected when it arrives (Gemini
@@ -582,10 +612,12 @@ Decided in review on 2026-10-27:
    Voice follow, each when its row in §10 is measured. GPT-Live and delegation to another harness
    (§5.5) are the second release.
 
-Still open:
-
-7. **The default `toolTimeoutSeconds`.** 15 s is a guess at what a caller tolerates in silence. It
-   is set from §1.6 item 1, and from listening to calls.
+7. **The default `toolTimeoutSeconds` is 10 s** (decided 2026-10-27 from §1.7). The provider waits
+   on a call in silence, without a limit of its own, and a pending call blocks nothing: the caller
+   can speak and the late result is still taken. So the limit bounds only the dead air before the
+   model can say what happened, and a shorter one costs nothing in correctness. With the one-line
+   instruction to say so before a tool (§5.2), the caller hears why before the wait starts. A
+   harness's owner raises it per tool, or marks a slow tool `async` (decision 3).
 
 ## 14. Sources
 
