@@ -242,18 +242,12 @@ class Server:
             raise UhpError(400, "invalid_input", "input has no text.", param="input")
         meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         prev = body.get("previous_response_id")
-        if prev:
-            prior = self.tasks.get(str(prev))
-            if prior is None:
-                raise UhpError(404, "response_not_found", "No response with that id.", param="previous_response_id")
-            session = prior.session
-            if meta.get("harness_id") and str(meta["harness_id"]) != harness_id(session.harness):
-                raise UhpError(409, "harness_mismatch", "That response belongs to another harness.", param="metadata.harness_id")
-        else:
+        session = self.continued(str(prev), meta) if prev else None
+        if session is None:
             h = self.harness(str(meta.get("harness_id") or self.default_harness))
             session = Session(id=_rid("hsess"), harness=h)
             self.sessions[session.id] = session
-        if session.running is not None:
+        if session.running is not None or self.live_call(session):
             raise UhpError(409, "session_busy", "This session is already running a task.")
         model = str(body.get("model") or session.harness.default_model or self.models[0])
         if model not in self.models:
@@ -333,10 +327,34 @@ class Server:
         for q in list(task.subscribers):
             q.put_nowait(None)
 
+    def continued(self, prev: str, meta: dict) -> Session:
+        """The session a `previous_response_id` continues: a text turn's, or a call's turn's. A call and the text
+        turns around it are one session, so a call can be followed in text and text by a call (design §6.1)."""
+        prior = self.tasks.get(prev)
+        session = prior.session if prior is not None else None
+        if session is None:
+            for call in self.calls.values():
+                if any(t.id == prev for t in call.record.turns):
+                    session = call.session
+                    break
+        if session is None:
+            raise UhpError(404, "response_not_found", "No response with that id.", param="previous_response_id")
+        if meta.get("harness_id") and str(meta["harness_id"]) != harness_id(session.harness):
+            raise UhpError(409, "harness_mismatch", "That response belongs to another harness.", param="metadata.harness_id")
+        return session
+
+    def live_call(self, session: Session) -> bool:
+        call = self.calls.get(session.id)
+        return call is not None and call.status in ("connecting", "live")
+
     # ── realtime calls (design §6.2) ─────────────────────────────────────────────────────────
     def create_call(self, body: dict, ws_base: str) -> dict:
         meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
-        h = self.harness(str(meta.get("harness_id") or self.default_harness))
+        prev = body.get("previous_response_id")
+        session = self.continued(str(prev), meta) if prev else None
+        if session is not None and (session.running is not None or self.live_call(session)):
+            raise UhpError(409, "session_busy", "This session is already running a task or a call.")
+        h = session.harness if session is not None else self.harness(str(meta.get("harness_id") or self.default_harness))
         model = str(body.get("model") or h.default_model or self.models[0])
         if model not in self.models:
             raise UhpError(422, "model_unavailable", f"This server does not run {model!r}.", param="model",
@@ -346,14 +364,17 @@ class Server:
             raise UhpError(400, "invalid_input", "This server connects calls over websocket.", param="transport")
         if self.credentials is None:
             raise UhpError(503, "server_unavailable", "This server has no model connection configured.", etype="server_error")
-        session = Session(id=_rid("hsess"), harness=h, kind="realtime")
-        self.sessions[session.id] = session
+        if session is None:
+            session = Session(id=_rid("hsess"), harness=h, kind="realtime")
+            self.sessions[session.id] = session
+        else:
+            session.kind = "realtime"
         token = secrets.token_urlsafe(32)
         call = Call(session=session, model=model, token=token, token_expires=time.time() + CONNECT_TOKEN_TTL_S)
         call.record = CallRecord(session.id, harness_id(h), model, call.publish)
         self.calls[session.id] = call
         self.tokens[token] = session.id
-        ignored = sorted(k for k in body if k not in {"model", "metadata", "transport", "voice"})
+        ignored = sorted(k for k in body if k not in {"model", "metadata", "transport", "voice", "previous_response_id"})
         return {**self.session_dict(session), "connect": {
             "transport": "websocket", "url": f"{ws_base}/v1/realtime/connect", "token": token,
             "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(call.token_expires))},
@@ -371,10 +392,18 @@ class Server:
     async def serve_call(self, websocket, call: Call) -> None:
         call.status = "live"
         await run_call(websocket, harness=call.session.harness, credentials=self.credentials, model=call.model,
-                       record=call.record, ended=call.ended, end_reason=call.end_reason)
-        call.reason = call.end_reason[0] if call.end_reason else "hangup"
-        call.status = "ended"
-        call.record.event({"type": "realtime.session.ended", "reason": call.reason,
+                       record=call.record, ended=call.ended, end_reason=call.end_reason, history=list(call.session.items))
+        self._close_call(call, call.end_reason[0] if call.end_reason else "hangup")
+
+    def _close_call(self, call: Call, reason: str) -> None:
+        """The call is over: its turns join the session's history, and the stream ends with its one terminal event."""
+        call.reason, call.status = reason, "ended"
+        self.tokens.pop(call.token, None)
+        for t in call.record.turns:
+            call.session.items += [dict(i) for i in t.input] + [dict(i) for i in t.output]
+        if call.record.turns:
+            call.session.last_response_id = call.record.turns[-1].id
+        call.record.event({"type": "realtime.session.ended", "reason": reason,
                            "ignored_device_events": call.record.ignored_device_events})
         call.closed.set()
         for q in list(call.subscribers):
@@ -462,10 +491,7 @@ class Server:
                 except asyncio.TimeoutError:
                     pass
             elif call.status == "connecting":
-                call.status, call.reason = "ended", "hangup"
-                self.tokens.pop(call.token, None)
-                call.record.event({"type": "realtime.session.ended", "reason": "hangup", "ignored_device_events": 0})
-                call.closed.set()
+                self._close_call(call, "hangup")
             return self.session_dict(s)
         if s.running:
             await self.cancel(s.running)

@@ -73,3 +73,33 @@ def test_hanging_up_ends_the_call_and_the_record_stays_readable():
     with c.stream("GET", f"/v1/sessions/{s['id']}/events", headers=H) as ev:
         lines = [ln for ln in ev.iter_lines() if ln.startswith("data: ")]
     assert len(lines) == 1 and '"realtime.session.ended"' in lines[0] and '"sequence_number": 0' in lines[0]
+
+
+def test_a_call_and_the_text_around_it_are_one_session():
+    server, c = _app()
+    s = c.post("/v1/realtime/sessions", headers=H, json={}).json()
+    call = server.calls[s["id"]]
+    call.record.user_said("What is the weather in Paris?")
+    call.record.model_said("It is clear.")
+    call.record.end_turn("completed")
+    turn_id = call.record.turns[0].id
+    # while the call is open the session is busy for a text turn
+    r = c.post("/v1/responses", headers=H, json={"input": "And tomorrow?", "previous_response_id": turn_id})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "session_busy"
+    # hung up: a text turn continues the call's session, and the call's turn is readable as a response
+    c.post(f"/v1/sessions/{s['id']}/cancel", headers=H)
+    assert server.continued(turn_id, {}) is call.session
+    assert [i["type"] for i in call.session.items] == ["message", "message"]          # the call joined the history
+    assert c.get(f"/v1/responses/{turn_id}", headers=H).json()["output"][0]["content"][0]["text"] == "It is clear."
+    # a new call can start from the same turn, in the same session
+    s2 = c.post("/v1/realtime/sessions", headers=H, json={"previous_response_id": turn_id}).json()
+    assert s2["id"] == s["id"] and "ignored_fields" not in (s2.get("metadata") or {})
+
+
+def test_a_call_starts_with_what_each_side_said_before():
+    from realtime_harness.call import context_messages
+    history = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
+               {"type": "function_call", "call_id": "c", "name": "weather", "arguments": "{}"},
+               {"type": "function_call_output", "call_id": "c", "output": "{}"},
+               {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "It is clear."}]}]
+    assert context_messages(history) == [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "It is clear."}]

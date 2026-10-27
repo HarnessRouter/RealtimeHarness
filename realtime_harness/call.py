@@ -337,8 +337,21 @@ def _recorder_class():
     return Recorder
 
 
+def context_messages(history: list[dict]) -> list[dict]:
+    """A session's earlier items as the conversation a call starts with: what each side said. Tool calls and
+    their results are not replayed as calls (their outcome is in what the model said about them)."""
+    out = []
+    for it in history:
+        if it.get("type") != "message":
+            continue
+        text = "".join(str(p.get("text") or "") for p in it.get("content") or [] if isinstance(p, dict)).strip()
+        if text:
+            out.append({"role": "assistant" if it.get("role") == "assistant" else "user", "content": text})
+    return out
+
+
 async def run_call(websocket, *, harness, credentials: Credentials, model: str, record: CallRecord,
-                   ended: asyncio.Event, end_reason: list[str]) -> None:
+                   ended: asyncio.Event, end_reason: list[str], history: list[dict] | None = None) -> None:
     """Serve one call on an accepted WebSocket until the device hangs up, the client cancels, the budget ends
     it, or the provider closes. `end_reason[0]` says which."""
     from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
@@ -406,7 +419,8 @@ async def run_call(websocket, *, harness, credentials: Credentials, model: str, 
         transport = FastAPIWebsocketTransport(websocket, FastAPIWebsocketParams(
             audio_in_enabled=True, audio_out_enabled=True, audio_in_sample_rate=SAMPLE_RATE,
             audio_out_sample_rate=SAMPLE_RATE, add_wav_header=False, serializer=serializer))
-        context = LLMContext([], tools) if tools else LLMContext([])
+        earlier = context_messages(history or [])
+        context = LLMContext(earlier, tools) if tools else LLMContext(earlier)
         user_agg, assistant_agg = LLMContextAggregatorPair(context)
         pipeline = Pipeline([transport.input(), user_agg, llm, transport.output(), assistant_agg])
         recorder = _recorder_class()(record, interrupted=lambda: record.end_turn("cancelled") if record.current else None)
