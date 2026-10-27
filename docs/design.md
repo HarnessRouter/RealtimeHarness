@@ -5,8 +5,8 @@ long-lived connection (OpenAI's gpt-realtime and GPT-Live, the same models on Az
 Live, Amazon Nova Sonic, xAI's Grok Voice, and the others that follow). The harness is open source
 (Apache-2.0) and will plug into HarnessRouter as the base `realtime`.
 
-This document is the design of record, and it is a draft for review: no code is written until it is
-agreed. Section 1 is what a realtime model is, from the providers' documentation and the source of
+This document is the design of record, agreed in review on 2026-10-27. Code starts once section 1
+is measured. Section 1 is what a realtime model is, from the providers' documentation and the source of
 the framework we build on. Its live measurements are marked **to measure**, and they replace the
 documentation's word before the first release. Section 2 derives the harness from section 1.
 Sections 3 to 11 cover leverage, the architecture, tool calls, the UHP extension, credentials,
@@ -199,9 +199,9 @@ What this means for the harness:
 
 - **The hook is ours to own.** Pipecat has no approval hook: `on_function_calls_started` runs as a
   background task and cannot block. The harness subclasses each service it uses and overrides
-  `run_function_calls`. Every call then passes through the harness's tool executor (§5.2), which
-  refuses, times out, records and answers, before any handler runs. One override covers every
-  provider.
+  `run_function_calls`. Every call then passes through the harness's tool executor (§5.2) before
+  any handler runs. The executor asks the server's approval gate where there is one, and it
+  refuses, times out, records and answers. One override covers every provider.
 - **An unknown tool name must never reach a service unanswered.** Nova Sonic raises
   `AWSNovaSonicUnhandledFunctionException` for a name with no handler, and its receive loop then
   resets the conversation. The harness registers a catch-all handler (`register_function(None, …)`;
@@ -305,7 +305,8 @@ where §1.6 item 5 shows the mint can lock the configuration.
    `response.output_item.added`, then `response.function_call_arguments.done`.
 3. The tool executor runs the call on the MCP server that owns the tool, under the harness's
    per-call timeout (`toolTimeoutSeconds`, default 15 s: on a voice call, a tool slower than that is
-   a dead line).
+   a dead line). Behind a server with an approval gate, the call goes through that gate exactly as
+   a text turn's call does, and a held call answers at once (§5.3).
 4. The result goes back to the provider in its own shape (§1.2), and the recorder writes the
    `function_call_output` item with the same `call_id`.
 
@@ -319,6 +320,19 @@ as the call's result, a short JSON object such as
 `{"error": "timeout", "detail": "the tool did not answer within 15 seconds"}`. The model can then say
 so. A call left unanswered stalls Gemini 3.1 Flash Live and GPT-Live's responses delegation
 outright, and the others in practice. The recorded `function_call_output` carries the same object.
+
+**A call that needs a person's approval is held, never waited on.** A server that gates some tool
+calls behind a person's approval (sending mail outside an allowed list, a write to a connected app, a
+paid run over a set amount) applies the same gate to a realtime session's calls as to a text turn's.
+The gate answers at once with its own held result, such as
+`{"status": "held", "approval_id": "…", "says": "…"}`. That is the call's result and the recorded
+`function_call_output`, byte for byte what a text turn records. It is neither a refusal nor a wait.
+The model tells the person the action is waiting for approval, and the conversation goes on. The
+person approves later, wherever they approve today, and the gate then runs the action as it does for
+a text turn. If the call is still live when the approval resolves, the harness may pass the outcome
+to the model as unspoken context, the async path of §5.4. Otherwise, the approval surface and the
+record carry it. Nothing on the call waits synchronously for a person, and voice keeps parity with
+text: whatever the harness can do in a text turn, it can do on a call, under the same gate.
 
 ### 5.4 Barge-in, cancellation, slow tools
 
@@ -560,9 +574,10 @@ Decided in review on 2026-10-27:
 4. **Cascades** (speech-to-text, any HarnessRouter text model, text-to-speech) are a separate base,
    after this one. Pipecat does them well, and they would put every text model behind a voice, but
    they are a different product with different latency.
-5. **Approvals.** A tool that needs a person's approval cannot wait on a voice call. In the first
-   release, such a tool is not offered in a realtime session, and the record says so. Spoken
-   confirmation ("Shall I send it?") is the model's job, prompted by the instructions.
+5. **Approvals: the same gate as in a text turn, answered at once** (§5.3). An approval-gated tool
+   is offered in a realtime session exactly as in a text turn. Leaving it out would make the voice
+   agent say it cannot do what the same harness does in text. Spoken confirmation before a call
+   ("Shall I send it?") remains the model's job, prompted by the instructions.
 6. **Providers.** The first release ships Azure OpenAI, OpenAI and Gemini Live. Nova Sonic and Grok
    Voice follow, each when its row in §10 is measured. GPT-Live and delegation to another harness
    (§5.5) are the second release.
