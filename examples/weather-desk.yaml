@@ -1,0 +1,8 @@
+# A harness for trying the server: one MCP server with a weather tool (tests/fixture_mcp.py).
+id: weather-desk
+name: Weather desk
+instructions: You are a helpful assistant. Use the weather tool for weather questions. Keep your answers short.
+tool_timeout_seconds: 10
+mcp_servers:
+  - name: fixture
+    url: http://127.0.0.1:18933/mcp
