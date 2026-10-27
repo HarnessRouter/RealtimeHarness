@@ -305,7 +305,7 @@ class Server:
                 result = await turn
         except CredentialError as e:
             result = TurnResult(status="failed", error={"code": "provider_unavailable", "message": str(e)})
-        except Exception as e:  # noqa: BLE001 — a failed task is a 200 with status failed, never a crash
+        except Exception as e:  # noqa: BLE001: a failed task is a 200 with status failed, never a crash
             result = TurnResult(status="failed", error={"code": "harness_error", "message": f"The turn failed ({type(e).__name__})."})
         finally:
             if conn is not None:

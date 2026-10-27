@@ -441,7 +441,7 @@ async def run_call(websocket, *, harness, credentials: Credentials, model: str, 
             stop_watch.cancel()
         if not end_reason:
             end_reason.append("provider_closed")
-    except Exception as e:  # noqa: BLE001 — the call ends, and the record says why
+    except Exception as e:  # noqa: BLE001: the call ends, and the record says why
         if not end_reason:
             end_reason.append("error")
         record.event({"type": "error", "error": {"type": "harness_error", "code": "call_failed",
