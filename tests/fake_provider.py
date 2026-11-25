@@ -35,8 +35,10 @@ def _tone(seconds: float) -> bytes:
 
 
 class FakeRealtime:
-    def __init__(self, utterances: list[str], drop_after: int | None = None, refuse_after: int | None = None):
+    def __init__(self, utterances: list[str], drop_after: int | None = None, refuse_after: int | None = None,
+                 model: str = ""):
         self.utterances = list(utterances)
+        self.model = model                      # what session.created names as the model, when it names one
         self.drop_after = drop_after
         self.refuse_after = refuse_after
         self.refused = 0
@@ -61,7 +63,8 @@ class FakeRealtime:
         async def send(ev: dict) -> None:
             await ws.send(json.dumps({"event_id": _id("event"), **ev}))
 
-        await send({"type": "session.created", "session": {"type": "realtime", "id": _id("sess")}})
+        await send({"type": "session.created", "session": {"type": "realtime", "id": _id("sess"),
+                                                            **({"model": self.model} if self.model else {})}})
         try:
             async for raw in ws:
                 m = json.loads(raw)
