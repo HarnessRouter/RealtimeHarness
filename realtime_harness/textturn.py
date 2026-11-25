@@ -33,6 +33,9 @@ class TurnResult:
     output: list[dict] = field(default_factory=list)
     usage: dict | None = None
     error: dict | None = None
+    # the model the provider says it is running, read off its own `session.created` (on Azure, where the
+    # request names a deployment, this is the model behind it); "" when the provider named none
+    model: str = ""
 
 
 class Listener:
@@ -101,7 +104,8 @@ async def run_text_turn(conn: Connection, *, instructions: str, executor: ToolEx
                 if ev.get("type") == "error":
                     raise _ProviderError(ev.get("error") or {})
 
-        await until("session.created")
+        created = await until("session.created")
+        result.model = str((created.get("session") or {}).get("model") or "")
         await send({"type": "session.update", "session": {
             "type": "realtime", "instructions": instructions, "output_modalities": ["text"],
             "tools": executor.functions(), "tool_choice": "auto"}})
@@ -136,10 +140,10 @@ async def run_text_turn(conn: Connection, *, instructions: str, executor: ToolEx
                 result.status = "cancelled"
                 return result
     except _ProviderError as e:
-        return TurnResult(status="failed", output=result.output, usage=result.usage,
+        return TurnResult(status="failed", output=result.output, usage=result.usage, model=result.model,
                           error={"code": "provider_error", "message": str(e)})
     except (asyncio.TimeoutError, websockets.ConnectionClosed) as e:
-        return TurnResult(status="failed", output=result.output, usage=result.usage,
+        return TurnResult(status="failed", output=result.output, usage=result.usage, model=result.model,
                           error={"code": "provider_error", "message": f"The model's connection ended ({type(e).__name__})."})
     finally:
         await ws.close()
