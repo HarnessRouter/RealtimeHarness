@@ -5,3 +5,8 @@ configuration against the caller, every tool call, the record of the call as a U
 credential and the meter (docs/design.md §2).
 """
 __version__ = "0.1.0.dev0"
+
+from . import standins
+
+# before anything imports Pipecat: an install without the LGPL `soxr` package still imports it (standins.py)
+standins.install()

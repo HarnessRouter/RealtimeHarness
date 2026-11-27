@@ -178,3 +178,27 @@ speech in [tests/fixtures](tests/fixtures).
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### An install without LGPL packages
+
+Pipecat is BSD-2-Clause, and its core install requires two LGPL packages: `soxr` (LGPL-2.1-or-later) and
+`num2words` (LGPL), which brings `docopt` with it. The harness uses neither, and runs without them:
+
+```bash
+.venv/bin/pip uninstall -y soxr num2words docopt
+```
+
+- `num2words` is used only by Pipecat's text transforms for speech synthesis, which the harness never imports.
+- `soxr` changes a sample rate. The harness runs every path at 24 kHz, the rate the model speaks, so it is
+  never called. Pipecat still imports it by name, so where it is absent the harness puts a stand-in of that
+  name in its place ([realtime_harness/standins.py](realtime_harness/standins.py)). A call to the stand-in
+  raises and says why.
+
+pip installs both again whenever it resolves Pipecat's requirements, so the uninstall follows every install
+or upgrade. An install from a hashed lock with `--no-deps` leaves them out of the lock instead. CI runs the
+whole suite both ways.
+
+Not covered by this: the `webrtc` extra. It installs aiortc, which requires PyAV. PyAV's own code is
+BSD-3-Clause, and its wheels bundle FFmpeg (LGPL at its most permissive) built with `libx264` and `libx265`,
+which are GPL (read from the 19.0.2 wheels for Linux x86-64 and arm64, 2026-11-27). An install that must hold
+no GPL or LGPL code leaves the extra out and takes calls over WebSocket.

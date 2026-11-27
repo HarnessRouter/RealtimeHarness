@@ -20,3 +20,13 @@ jobs:
       - run: pip install -e ".[test,webrtc]"
       # no provider key: whole calls run against tests/fake_provider.py, tools against tests/fixture_mcp.py
       - run: python -m pytest -q
+      # Pipecat's core install requires two LGPL packages the harness does not use (README, License).
+      # The same suite with them taken out: the install the README describes is the one that is tested.
+      - run: pip uninstall -y soxr num2words docopt
+      - run: |
+          python - <<'PY'
+          import importlib.util
+          left = [m for m in ("soxr", "num2words", "docopt") if importlib.util.find_spec(m)]
+          assert not left, left
+          PY
+      - run: python -m pytest -q
