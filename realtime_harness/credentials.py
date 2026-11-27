@@ -107,14 +107,7 @@ class HarnessRouterMint(Credentials):
                 why = ""
             raise CredentialError(f"the server did not mint a credential (HTTP {r.status_code}{', ' + why if why else ''})")
         d = r.json()
-        host = urllib.parse.urlsplit(str(d.get("webrtc_url") or "")).hostname or ""
-        secret = str(d.get("client_secret") or "")
-        deployment = str(d.get("deployment") or "")
-        if not (host and secret and deployment):
-            raise CredentialError("the server's mint answered without a usable credential")
-        url = f"wss://{host}/openai/v1/realtime?model={urllib.parse.quote(deployment)}"
-        return Connection(url=url, headers={"Authorization": f"Bearer {secret}"}, model=deployment,
-                          ref={"server_session": str(d.get("session_id") or "")})
+        return _minted(d, {"server_session": str(d.get("session_id") or "")})
 
     async def release(self, conn: Connection) -> None:
         sid = conn.ref.get("server_session")
@@ -125,6 +118,59 @@ class HarnessRouterMint(Credentials):
                 await c.post(f"{self.base}/v1/realtime/sessions/{urllib.parse.quote(sid)}/end", headers=self._headers())
         except httpx.HTTPError:
             pass        # the server's sweep meters a call nobody ended to its max_minutes
+
+
+def _minted(d, ref: dict) -> Connection:
+    """A server's mint answer as a connection: the provider's host, the deployment, and the client secret as
+    the bearer that opens the socket."""
+    d = d if isinstance(d, dict) else {}
+    host = urllib.parse.urlsplit(str(d.get("webrtc_url") or "")).hostname or ""
+    secret = str(d.get("client_secret") or "")
+    deployment = str(d.get("deployment") or "")
+    if not (host and secret and deployment):
+        raise CredentialError("the server's mint answered without a usable credential")
+    url = f"wss://{host}/openai/v1/realtime?model={urllib.parse.quote(deployment)}"
+    return Connection(url=url, headers={"Authorization": f"Bearer {secret}"}, model=deployment, ref=ref)
+
+
+class ServerCall(Credentials):
+    """One call's own way to the provider, handed over by the server that placed the call (design §7): a URL
+    on that server and a token good for this call alone. Each connection the call opens (the first, and one
+    after the provider drops) POSTs there and gets a fresh short-lived provider credential, in the shape of
+    the server's mint answer. The server holds the provider key and the meter; ending the call is the
+    server's own doing, so there is nothing to release.
+
+    The URL and the token arrive in the request that creates the call, from a caller this harness trusts
+    with its configuration (uhp.Server's operator keys). Neither is stored beyond the call or logged."""
+
+    def __init__(self, url: str, token: str):
+        u = urllib.parse.urlsplit(str(url or ""))
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise CredentialError("a call's upstream needs an http(s) url")
+        if not str(token or "").strip():
+            raise CredentialError("a call's upstream needs a token")
+        self.url = str(url)
+        self._token = str(token).strip()
+
+    async def connect(self, model: str) -> Connection:
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(self.url, json={"model": model},
+                                 headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"})
+        except httpx.HTTPError as e:
+            raise CredentialError(f"the server's upstream could not be reached ({type(e).__name__})") from None
+        if r.status_code not in (200, 201):
+            try:
+                err = (r.json() or {}).get("error") or {}
+                why = f"{err.get('code') or ''} {err.get('message') or ''}".strip()
+            except ValueError:
+                why = ""
+            raise CredentialError(f"the server did not mint a credential (HTTP {r.status_code}{', ' + why if why else ''})")
+        try:
+            d = r.json()
+        except ValueError:
+            d = {}
+        return _minted(d, {})
 
 
 def from_env() -> Credentials:

@@ -25,8 +25,8 @@ from . import __version__
 from .call import CallRecord, run_call
 from . import webrtc
 from .device import DeviceLink
-from .config import HarnessConfig
-from .credentials import CredentialError, Credentials
+from .config import ConfigError, HarnessConfig
+from .credentials import CredentialError, Credentials, ServerCall
 from .textturn import Listener, TurnResult, run_text_turn
 from .tools import ToolExecutor
 
@@ -82,6 +82,7 @@ class Call:
     token: str
     token_expires: float
     record: CallRecord | None = None
+    credentials: Credentials | None = None        # this call's way to the provider: its own, or the server's
     status: str = "connecting"                    # connecting | live | paused | ended
     reason: str | None = None
     token_used: bool = False
@@ -196,13 +197,17 @@ def _input_text(inp) -> str:
 
 class Server:
     def __init__(self, harnesses: list[HarnessConfig], credentials: Credentials | None, api_keys: set[str],
-                 models: list[str] | None = None):
-        if not harnesses:
+                 models: list[str] | None = None, operator_keys: set[str] | None = None):
+        # An operator key is the key of a server this harness works for (HarnessRouter). It is an API key
+        # that may also hand a call its configuration and its provider connection (create_call); a server
+        # with one needs no harness of its own.
+        self.operator_keys = set(operator_keys or ())
+        if not harnesses and not self.operator_keys:
             raise ValueError("a server needs at least one harness")
         self.harnesses = {harness_id(h): h for h in harnesses}
-        self.default_harness = harness_id(harnesses[0])
+        self.default_harness = harness_id(harnesses[0]) if harnesses else ""
         self.credentials = credentials
-        self.api_keys = api_keys
+        self.api_keys = set(api_keys) | self.operator_keys
         self.models = models or [DEFAULT_MODEL]
         self.tasks: dict[str, Task] = {}
         self.sessions: dict[str, Session] = {}
@@ -355,14 +360,45 @@ class Server:
         return call is not None and call.status in ("connecting", "live")
 
     # ── realtime calls (design §6.2) ─────────────────────────────────────────────────────────
-    def create_call(self, body: dict, base: str) -> dict:
-        """`base` is the server's own URL as the client reached it (scheme and host)."""
+    def _call_harness(self, given) -> HarnessConfig:
+        """The configuration an operator hands one call: a harness file's fields, taken as written."""
+        if not isinstance(given, dict):
+            raise UhpError(400, "invalid_input", "harness is an object: a harness file's fields.", param="harness")
+        try:
+            return HarnessConfig.from_dict(given, env=False)
+        except (ConfigError, TypeError, ValueError) as e:
+            raise UhpError(400, "invalid_input", f"harness: {e}", param="harness") from None
+
+    def _call_upstream(self, given) -> Credentials:
+        if not isinstance(given, dict):
+            raise UhpError(400, "invalid_input", "upstream is an object: {url, token}.", param="upstream")
+        try:
+            return ServerCall(str(given.get("url") or ""), str(given.get("token") or ""))
+        except CredentialError as e:
+            raise UhpError(400, "invalid_input", f"upstream: {e}", param="upstream") from None
+
+    def create_call(self, body: dict, base: str, operator: bool = False) -> dict:
+        """`base` is the server's own URL as the client reached it (scheme and host).
+
+        `operator`: the request carried an operator key. Only then are `harness` (this call's configuration)
+        and `upstream` (this call's way to the provider) read; from any other caller they are fields this
+        server does not act on, named in metadata.ignored_fields like any other. So the configuration stays
+        its owner's: the server the harness works for, never the caller of a call (design §2.1)."""
         meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         prev = body.get("previous_response_id")
+        given = body.get("harness") if operator and body.get("harness") is not None else None
+        upstream = body.get("upstream") if operator and body.get("upstream") is not None else None
+        if given is not None and prev:
+            raise UhpError(400, "invalid_input", "A call that continues a session keeps that session's harness.",
+                           param="harness")
         session = self.continued(str(prev), meta) if prev else None
         if session is not None and (session.running is not None or self.live_call(session)):
             raise UhpError(409, "session_busy", "This session is already running a task or a call.")
-        h = session.harness if session is not None else self.harness(str(meta.get("harness_id") or self.default_harness))
+        if given is not None:
+            h = self._call_harness(given)
+        else:
+            h = session.harness if session is not None else self.harness(str(meta.get("harness_id") or self.default_harness))
+        credentials = self._call_upstream(upstream) if upstream is not None else self.credentials
         model = str(body.get("model") or h.default_model or self.models[0])
         if model not in self.models:
             raise UhpError(422, "model_unavailable", f"This server does not run {model!r}.", param="model",
@@ -371,7 +407,7 @@ class Server:
         transports = ["websocket"] + (["webrtc"] if webrtc.available() else [])
         if transport not in transports:
             raise UhpError(400, "invalid_input", f"This server connects calls over {' or '.join(transports)}.", param="transport")
-        if self.credentials is None:
+        if credentials is None:
             raise UhpError(503, "server_unavailable", "This server has no model connection configured.", etype="server_error")
         if session is None:
             session = Session(id=_rid("hsess"), harness=h, kind="realtime")
@@ -380,11 +416,12 @@ class Server:
             session.kind = "realtime"
         token = secrets.token_urlsafe(32)
         call = Call(session=session, model=model, token=token, token_expires=time.time() + CONNECT_TOKEN_TTL_S,
-                    transport=transport)
+                    transport=transport, credentials=credentials)
         call.record = CallRecord(session.id, harness_id(h), model, call.publish)
         self.calls[session.id] = call
         self.tokens[token] = session.id
-        ignored = sorted(k for k in body if k not in {"model", "metadata", "transport", "voice", "previous_response_id"})
+        acted_on = {"model", "metadata", "transport", "voice", "previous_response_id"} | ({"harness", "upstream"} if operator else set())
+        ignored = sorted(k for k in body if k not in acted_on)
         if transport == "websocket":
             base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         return {**self.session_dict(session), "connect": {
@@ -426,7 +463,7 @@ class Server:
         return lost, back
 
     async def _run_call(self, call: Call) -> None:
-        await run_call(call.device, harness=call.session.harness, credentials=self.credentials, model=call.model,
+        await run_call(call.device, harness=call.session.harness, credentials=call.credentials or self.credentials, model=call.model,
                        record=call.record, ended=call.ended, end_reason=call.end_reason, history=list(call.session.items))
         await call.device.close()
         self._close_call(call, call.end_reason[0] if call.end_reason else "hangup")
@@ -622,6 +659,10 @@ def create_app(server: Server) -> FastAPI:
         if scheme.lower() != "bearer" or not token or token.strip() not in server.api_keys:
             raise UhpError(401, "invalid_credential", "The bearer token is not valid.", etype="authentication_error")
 
+    def operator(request: Request) -> bool:
+        scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+        return scheme.lower() == "bearer" and bool(token.strip()) and token.strip() in server.operator_keys
+
     @app.exception_handler(UhpError)
     async def _uhp_error(request: Request, e: UhpError):
         return fail(e)
@@ -714,7 +755,7 @@ def create_app(server: Server) -> FastAPI:
             body = await json_body(request)
             scheme = "https" if (request.headers.get("x-forwarded-proto") or request.url.scheme) in ("https", "wss") else "http"
             host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-            return JSONResponse(server.create_call(body, f"{scheme}://{host}"), status_code=201)
+            return JSONResponse(server.create_call(body, f"{scheme}://{host}", operator=operator(request)), status_code=201)
         return await guarded(request, h)
 
     @app.websocket("/v1/realtime/connect")
@@ -786,11 +827,20 @@ def create_app(server: Server) -> FastAPI:
     return app
 
 
-def api_keys_from_env() -> set[str]:
-    """RTH_API_KEYS (comma separated) or RTH_API_KEYS_FILE (one key per line)."""
-    keys = {k.strip() for k in (os.environ.get("RTH_API_KEYS") or "").split(",") if k.strip()}
-    path = os.environ.get("RTH_API_KEYS_FILE")
+def _keys_from_env(name: str) -> set[str]:
+    keys = {k.strip() for k in (os.environ.get(name) or "").split(",") if k.strip()}
+    path = os.environ.get(name + "_FILE")
     if path:
         with open(path, encoding="utf-8") as f:
             keys |= {ln.strip() for ln in f if ln.strip()}
     return keys
+
+
+def api_keys_from_env() -> set[str]:
+    """RTH_API_KEYS (comma separated) or RTH_API_KEYS_FILE (one key per line)."""
+    return _keys_from_env("RTH_API_KEYS")
+
+
+def operator_keys_from_env() -> set[str]:
+    """RTH_OPERATOR_KEYS or RTH_OPERATOR_KEYS_FILE: the keys of the server this harness works for."""
+    return _keys_from_env("RTH_OPERATOR_KEYS")
