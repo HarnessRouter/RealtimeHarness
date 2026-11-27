@@ -60,7 +60,9 @@ class McpServer:
     disabled_tools: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "McpServer":
+    def from_dict(cls, d: dict, env: bool = True) -> "McpServer":
+        """`env` False takes a header's value as written: `${NAME}` is this process's environment, which a
+        file's author may read and a request must not (a header goes to a URL the same request names)."""
         name = str(d.get("name") or "").strip()
         url = str(d.get("url") or "").strip()
         if not name or not url:
@@ -68,7 +70,7 @@ class McpServer:
         transport = str(d.get("transport") or "http").lower()
         if transport not in ("http", "sse"):
             raise ConfigError(f"MCP server {name!r}: transport is http or sse, not {transport!r}")
-        headers = {str(k): _env(str(v)) for k, v in (d.get("headers") or {}).items()}
+        headers = {str(k): (_env(str(v)) if env else str(v)) for k, v in (d.get("headers") or {}).items()}
         return cls(name=name, url=url, transport=transport, headers=headers,
                    enabled=bool(d.get("enabled", True)),
                    disabled_tools=[str(t) for t in d.get("disabled_tools") or d.get("disabledTools") or []])
@@ -90,7 +92,7 @@ class HarnessConfig:
     transcription_model: str = ""
 
     @classmethod
-    def from_dict(cls, d: dict) -> "HarnessConfig":
+    def from_dict(cls, d: dict, env: bool = True) -> "HarnessConfig":
         hid = str(d.get("id") or "").strip()
         if not hid:
             raise ConfigError("a harness needs an id")
@@ -100,7 +102,7 @@ class HarnessConfig:
             raise ConfigError(f"harness {hid!r}: tool_timeout_seconds and max_call_minutes are positive")
         return cls(id=hid, name=str(d.get("name") or hid), instructions=str(d.get("instructions") or ""),
                    voice=str(d.get("voice") or DEFAULT_VOICE),
-                   mcp_servers=[McpServer.from_dict(s) for s in d.get("mcp_servers") or []],
+                   mcp_servers=[McpServer.from_dict(s, env) for s in d.get("mcp_servers") or []],
                    disabled_tools=[str(t) for t in d.get("disabled_tools") or []],
                    tool_timeout_seconds=timeout, max_call_minutes=minutes,
                    default_model=str(d.get("default_model") or ""),

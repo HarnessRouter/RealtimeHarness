@@ -96,6 +96,34 @@ export RTH_SERVER_URL=https://<your-server>/api/harness RTH_SERVER_HARNESS=<the 
 export RTH_SERVER_TOKEN_FILE=<a file holding the server's API token>
 ```
 
+### As the realtime service of a HarnessRouter server
+
+The other way round: the server places each call, and this harness carries it. The server's key is an
+**operator key**, and with it the request that creates a call brings what the call runs with:
+
+```bash
+export RTH_OPERATOR_KEYS_FILE=<a file holding the key the server calls with>
+rth serve --host 0.0.0.0 --port 8790        # no harness file, no provider key
+```
+
+```
+POST /v1/realtime/sessions        Authorization: Bearer <operator key>
+{"transport": "websocket",
+ "harness":  {"id": "chrn_…", "instructions": "…", "voice": "marin", "max_call_minutes": 10,
+              "mcp_servers": [{"name": "plugs", "url": "https://<server>/…", "headers": {"Authorization": "Bearer …"}}]},
+ "upstream": {"url": "https://<server>/…", "token": "<good for this call alone>"}}
+```
+
+- `harness` is a harness file's fields, for this call only. A header's value is taken as written: `${NAME}`
+  is read from the environment in a harness **file**, never in a request.
+- `upstream` is where this call gets its provider connection. Each connection the call opens POSTs there with
+  the token and gets a short-lived credential back, so the provider key stays on the server.
+- From any caller without an operator key, both fields are ignored and named in `metadata.ignored_fields`,
+  like any field the server does not act on. A call's configuration stays its owner's.
+
+An operator key is also an API key. Give it to the server only: whoever holds it decides what a call's model
+is told and which tool servers it reaches.
+
 ## The API
 
 Everything a UHP Core server serves (`/v1/uhp`, `/v1/harnesses`, `/v1/models`, `/v1/responses` in blocking,
