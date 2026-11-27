@@ -1,0 +1,143 @@
+name: release
+
+# A tag v<version> publishes the package it names. The wheel is built from the tag by pinned, hashed
+# build tools (.github/build-requirements.txt), with the tag commit's time as SOURCE_DATE_EPOCH, so the
+# same tag builds the same bytes (the wheel only: an sdist's tar.gz is not reproducible, and the
+# release's source archive is the source); checked: the version is the tag's, the wheel installs in an
+# empty venv, imports, and the tests pass against it rather than against the checkout; and attached to
+# the tag's GitHub release, which is created if it is not there. A file already attached is never
+# replaced: whoever holds its digest holds what it was.
+#
+# The workflow is SystemOneHarness's, with this package's names and its own way of testing a wheel.
+#
+# Two jobs, so the code the check installs from PyPI (the package's own dependencies and pytest, not
+# hash-pinned) never runs where a token can write: `build` reads only, with no credential left in the
+# checkout; `publish` writes the release and runs nothing but gh, on the wheel `build` handed over, after
+# checking it is the file `build` hashed.
+#
+# HarnessRouter installs this harness from that wheel, with the wheel's sha256 in its lock
+# (harnessrouter: docker/locks/realtime.lock.txt), so nothing is built there at install time.
+#
+# Run by hand (Actions › release › Run workflow) to build a tag again, or one pushed while the
+# workflow was not on the default branch.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The tag to build and attach, for example v0.1.0'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    outputs:
+      wheel: ${{ steps.wheel.outputs.name }}
+      sha256: ${{ steps.wheel.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0             # the tag object and its commit, for the version check and SOURCE_DATE_EPOCH
+          persist-credentials: false # nothing later in this job may push or write with the checkout's token
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: The tag names a version, and pyproject.toml says the same
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a v<major>.<minor>.<patch> tag"; exit 1; }
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || { echo "::error::no tag $TAG"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$(git rev-parse "$TAG^{commit}")" ] || { echo "::error::the checkout is not $TAG"; exit 1; }
+          V="${TAG#v}"
+          P="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          [ "$V" = "$P" ] || { echo "::error::the tag says $V, pyproject.toml says $P"; exit 1; }
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Build the wheel with the build tools the lock names
+        id: wheel
+        run: |
+          set -euo pipefail
+          # The tools come from the workflow's own commit, never from the tag being built: a tag is not
+          # where the build's trust is set.
+          git show "$GITHUB_WORKFLOW_SHA:.github/build-requirements.txt" > "$RUNNER_TEMP/build-requirements.txt"
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-deps -r "$RUNNER_TEMP/build-requirements.txt"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$TAG^{commit}")"; export SOURCE_DATE_EPOCH
+          python3 -m build --wheel --no-isolation
+          ls -l dist
+          [ "$(ls dist | wc -l)" = 1 ] && [ "$(ls dist/*.whl | wc -l)" = 1 ] || { echo "::error::expected one wheel and nothing else"; exit 1; }
+          W="$(basename dist/*.whl)"
+          echo "name=$W" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "dist/$W" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          (cd dist && sha256sum ./*)
+
+      - name: The wheel installs in an empty venv, imports, and passes the tests
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --disable-pip-version-check "$(ls dist/*.whl)[test,webrtc]"
+          # python -I: the checkout's own realtime_harness/ is in the current directory, and must not be what imports.
+          /tmp/venv/bin/python -I -c "import realtime_harness; v = realtime_harness.__version__; assert v == '$VERSION', v"
+          PKG="$(/tmp/venv/bin/python -I -c 'import realtime_harness, pathlib; p = pathlib.Path(realtime_harness.__file__).parent; assert str(p).startswith("/tmp/venv/"), p; print(p)')"
+          echo "the wheel imports from $PKG"
+          /tmp/venv/bin/rth --help >/dev/null
+          # The tests run from a directory that holds a copy of tests/ and, beside it, the INSTALLED package
+          # under the name the tests look for. This repository's pytest settings put the current directory on
+          # the path, two tests read the package's files beside tests/, and others start `python -c` there:
+          # in the checkout every one of those would be the checkout's code and not the wheel's.
+          mkdir /tmp/wheel-tests
+          cp -R tests /tmp/wheel-tests/tests
+          cp pyproject.toml /tmp/wheel-tests/pyproject.toml     # the pytest settings only; nothing is built from it
+          ln -s "$PKG" /tmp/wheel-tests/realtime_harness
+          cd /tmp/wheel-tests
+          /tmp/venv/bin/python -m pytest -q -p no:cacheprovider
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/${{ steps.wheel.outputs.name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      WHEEL: ${{ needs.build.outputs.wheel }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+
+      - name: Attach the wheel to the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a v<major>.<minor>.<patch> tag"; exit 1; }
+          [ "$(ls dist)" = "$WHEEL" ] || { echo "::error::dist holds $(ls dist | tr '\n' ' '), not $WHEEL alone"; exit 1; }
+          [ "$(sha256sum "dist/$WHEEL" | cut -d' ' -f1)" = "$SHA256" ] || { echo "::error::$WHEEL is not the file the build job hashed"; exit 1; }
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag \
+              || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$WHEEL"; then
+            echo "::error::$WHEEL is already attached to $TAG; a changed file needs a new version"; exit 1
+          fi
+          gh release upload "$TAG" "dist/$WHEEL"
+          { echo "## $TAG"; echo; echo 'Attached, with the sha256 a lock elsewhere pins:'; echo; echo '```'; echo "$SHA256  $WHEEL"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
